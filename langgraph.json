@@ -1,0 +1,43 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "eva_assistant": {
+      "path": "eva_assistant.agent.graph:get_eva_graph",
+      "description": "Eva - AI Executive Assistant for scheduling and calendar management",
+      "config_schema": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "default": "founder",
+            "description": "User identifier for the conversation"
+          },
+          "conversation_id": {
+            "type": "string", 
+            "description": "Optional conversation ID for thread management"
+          },
+          "with_persistence": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable SQLite conversation persistence"
+          }
+        }
+      }
+    }
+  },
+  "env": [
+    "OPENAI_API_KEY",
+    "LANGSMITH_API_KEY",
+    "LANGSMITH_TRACING_V2",
+    "LANGSMITH_ENDPOINT",
+    "LANGSMITH_PROJECT"
+  ],
+  "dockerfile_lines": [
+    "RUN mkdir -p /app/data",
+    "RUN mkdir -p /app/oauth/token", 
+    "COPY oauth/ /app/oauth/",
+    "COPY data/ /app/data/"
+  ]
+} 

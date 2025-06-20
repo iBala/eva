@@ -27,6 +27,7 @@ from eva_assistant.app.schemas import (
 )
 from eva_assistant.auth.oauth_manager import oauth_manager
 from eva_assistant.config import settings
+from eva_assistant.agent.graph import get_eva_graph
 
 # Configure logging
 logging.basicConfig(
@@ -41,8 +42,13 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("🚀 Starting Eva Assistant API...")
     
-    # TODO: Initialize LangGraph agent here when implemented
-    # agent = EvaGraph.build()
+    # Initialize LangGraph agent
+    try:
+        eva_graph = get_eva_graph()
+        logger.info("✅ Eva LangGraph agent initialized successfully!")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Eva agent: {e}")
+        # Continue without agent - will use mock responses
     
     logger.info("✅ Eva Assistant API started successfully!")
     yield
@@ -72,9 +78,9 @@ def generate_conversation_id() -> str:
     return str(uuid.uuid4())
 
 
-async def mock_eva_response(message: str, user_id: str, conversation_id: str) -> str:
+async def eva_response(message: str, user_id: str, conversation_id: str) -> str:
     """
-    Mock Eva response for testing until LangGraph agent is implemented.
+    Get Eva's response using the LangGraph agent.
     
     Args:
         message: User message
@@ -82,24 +88,33 @@ async def mock_eva_response(message: str, user_id: str, conversation_id: str) ->
         conversation_id: Conversation ID
         
     Returns:
-        Mock response from Eva
+        Eva's response
     """
-    # This is a placeholder - will be replaced with actual LangGraph agent
-    logger.info(f"Processing message from {user_id}: {message}")
-    
-    if "meeting" in message.lower() or "schedule" in message.lower():
-        return f"I can help you schedule a meeting! To proceed, I'll need to check your calendar availability. Would you like me to find a suitable time slot?"
-    elif "calendar" in message.lower():
-        return f"I can access your calendar to check availability and schedule meetings. What would you like me to help you with?"
-    elif "hello" in message.lower() or "hi" in message.lower():
-        return f"Hello! I'm Eva, your AI executive assistant. I can help you schedule meetings, check calendar availability, and manage your email communications. What can I assist you with today?"
-    else:
-        return f"I understand you'd like help with: {message}. As your executive assistant, I can help with meeting scheduling, calendar management, and email coordination. Could you provide more details about what you need?"
+    try:
+        # Use the LangGraph agent
+        eva_graph = get_eva_graph()
+        result = await eva_graph.process_message(message, user_id, conversation_id)
+        return result.get("response", "I apologize, but I'm having trouble processing your request right now.")
+        
+    except Exception as e:
+        logger.error(f"Eva agent error: {e}")
+        
+        # Fallback to mock response
+        logger.info(f"Using fallback response for: {message}")
+        
+        if "meeting" in message.lower() or "schedule" in message.lower():
+            return f"I can help you schedule a meeting! To proceed, I'll need to check your calendar availability. Would you like me to find a suitable time slot?"
+        elif "calendar" in message.lower():
+            return f"I can access your calendar to check availability and schedule meetings. What would you like me to help you with?"
+        elif "hello" in message.lower() or "hi" in message.lower():
+            return f"Hello! I'm Eva, your AI executive assistant. I can help you schedule meetings, check calendar availability, and manage your email communications. What can I assist you with today?"
+        else:
+            return f"I understand you'd like help with: {message}. As your executive assistant, I can help with meeting scheduling, calendar management, and email coordination. Could you provide more details about what you need?"
 
 
-async def mock_eva_stream(message: str, user_id: str, conversation_id: str) -> AsyncGenerator[StreamChunk, None]:
+async def eva_stream(message: str, user_id: str, conversation_id: str) -> AsyncGenerator[StreamChunk, None]:
     """
-    Mock streaming response from Eva.
+    Stream Eva's response using the LangGraph agent.
     
     Args:
         message: User message
@@ -109,23 +124,61 @@ async def mock_eva_stream(message: str, user_id: str, conversation_id: str) -> A
     Yields:
         StreamChunk: Individual response chunks
     """
-    response = await mock_eva_response(message, user_id, conversation_id)
-    
-    # Split response into chunks for streaming
-    words = response.split()
-    current_chunk = ""
-    
-    for i, word in enumerate(words):
-        current_chunk += word + " "
+    try:
+        # Use the LangGraph agent streaming
+        eva_graph = get_eva_graph()
         
-        # Send chunk every 3-5 words or at the end
-        if (i + 1) % 4 == 0 or i == len(words) - 1:
-            yield StreamChunk(
-                content=current_chunk.strip(),
-                type="text",
-                conversation_id=conversation_id
-            )
-            current_chunk = ""
+        async for chunk in eva_graph.stream_message(message, user_id, conversation_id):
+            if chunk.get("type") == "progress":
+                # Send progress updates
+                yield StreamChunk(
+                    content=f"Processing: {chunk.get('node', 'unknown')}",
+                    type="progress",
+                    conversation_id=conversation_id,
+                    metadata=chunk.get("metadata", {})
+                )
+            elif chunk.get("type") == "response":
+                # Send final response in chunks
+                response = chunk.get("response", "")
+                words = response.split()
+                current_chunk = ""
+                
+                for i, word in enumerate(words):
+                    current_chunk += word + " "
+                    
+                    # Send chunk every 4 words or at the end
+                    if (i + 1) % 4 == 0 or i == len(words) - 1:
+                        yield StreamChunk(
+                            content=current_chunk.strip(),
+                            type="text",
+                            conversation_id=conversation_id
+                        )
+                        current_chunk = ""
+            elif chunk.get("type") == "error":
+                yield StreamChunk(
+                    content=f"Error: {chunk.get('error', 'Unknown error')}",
+                    type="error",
+                    conversation_id=conversation_id
+                )
+    
+    except Exception as e:
+        logger.error(f"Eva streaming error: {e}")
+        
+        # Fallback to simple response
+        response = await eva_response(message, user_id, conversation_id)
+        words = response.split()
+        current_chunk = ""
+        
+        for i, word in enumerate(words):
+            current_chunk += word + " "
+            
+            if (i + 1) % 4 == 0 or i == len(words) - 1:
+                yield StreamChunk(
+                    content=current_chunk.strip(),
+                    type="text",
+                    conversation_id=conversation_id
+                )
+                current_chunk = ""
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -161,8 +214,8 @@ async def chat(request: ChatRequest):
         
         logger.info(f"Chat request from {request.user_id}: {request.message}")
         
-        # TODO: Replace with actual LangGraph agent call
-        response = await mock_eva_response(request.message, request.user_id, conversation_id)
+        # Use LangGraph agent for response
+        response = await eva_response(request.message, request.user_id, conversation_id)
         
         return ChatResponse(
             response=response,
@@ -199,8 +252,8 @@ async def stream_chat(request: ChatRequest):
         
         async def generate_stream():
             try:
-                # TODO: Replace with actual LangGraph agent streaming
-                async for chunk in mock_eva_stream(request.message, request.user_id, conversation_id):
+                # Use LangGraph agent for streaming
+                async for chunk in eva_stream(request.message, request.user_id, conversation_id):
                     yield f"data: {chunk.json()}\n\n"
                 
                 # Send end marker

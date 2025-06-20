@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # OpenAI Configuration
     openai_api_key: str
     
+    # LangSmith Configuration (optional)
+    langsmith_api_key: str = ""
+    langsmith_tracing_v2: str = "true"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_project: str = "eva-assistant"
+    
     # Database Configuration
     database_url: str = "sqlite:///./data/eva.db"
     
@@ -38,8 +44,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     
     # Email Processing Configuration
-    email_poll_interval: int = 60  # seconds
-    email_response_timeout: int = 300  # seconds
+    email_poll_interval: int = 60
+    email_response_timeout: int = 300
     
     # Security Configuration
     secret_key: str
@@ -61,7 +67,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     oauth_dir: Path = Path("./oauth")
     token_dir: Path = Path("./oauth/tokens")
-    user_tokens_dir: Path = Path("./data/user_tokens")  # For user calendar tokens
+    user_tokens_dir: Path = Path("./data/user_tokens")
     
     @field_validator('data_dir', 'oauth_dir', 'token_dir', 'user_tokens_dir')
     @classmethod
