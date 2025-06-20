@@ -1,0 +1,16 @@
+# Eva Assistant - Development Dependencies
+# Install with: uv pip install -r requirements.txt -r requirements-dev.txt
+
+# Testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.11.0
+pytest-cov>=4.1.0
+
+# Code Quality
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.5.0
+
+# Development Tools
+pre-commit>=3.3.0 

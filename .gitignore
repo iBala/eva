@@ -1,0 +1,5 @@
+.cursor/
+.env
+*.mdc
+.venv/
+oauth/
