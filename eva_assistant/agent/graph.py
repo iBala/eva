@@ -11,7 +11,7 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from eva_assistant.agent.state import EvaState, create_eva_state
-from eva_assistant.agent.nodes import plan_node, act_node, reflect_node
+from eva_assistant.agent.nodes import meeting_agent_node, reflect_node
 from eva_assistant.config import settings
 
 logger = logging.getLogger(__name__)
@@ -35,28 +35,26 @@ class EvaGraph:
         self._build_graph()
     
     def _build_graph(self):
-        """Build the LangGraph workflow."""
+        """Build the simplified LangGraph workflow."""
         logger.info("Building Eva conversation graph")
         
         # Create the graph
         workflow = StateGraph(EvaState)
         
-        # Add nodes
-        workflow.add_node("plan", plan_node)
-        workflow.add_node("act", act_node)
+        # Add nodes - simplified to just meeting_agent and reflect
+        workflow.add_node("meeting_agent", meeting_agent_node)
         workflow.add_node("reflect", reflect_node)
         
         # Define the flow
-        workflow.add_edge(START, "plan")
-        workflow.add_edge("plan", "act")
+        workflow.add_edge(START, "meeting_agent")
         
-        # Conditional edge from act node
+        # Conditional edge from meeting_agent node
         workflow.add_conditional_edges(
-            "act",
-            self._should_continue_acting,
+            "meeting_agent",
+            self._should_reflect,
             {
-                "continue": "act",    # Loop back to act if more steps
-                "reflect": "reflect"  # Move to reflect when done
+                "reflect": "reflect",         # Move to reflection
+                "continue": "meeting_agent"   # Continue if more work needed
             }
         )
         
@@ -65,8 +63,8 @@ class EvaGraph:
             "reflect",
             self._should_end,
             {
-                "end": END,          # End if response is ready
-                "continue": "act"    # Back to act if more actions needed
+                "end": END,                   # End if response is ready
+                "continue": "meeting_agent"   # Back to meeting_agent if more work needed
             }
         )
         
@@ -76,28 +74,34 @@ class EvaGraph:
         
         logger.info("Eva conversation graph built successfully")
     
-    def _should_continue_acting(self, state: EvaState) -> Literal["continue", "reflect"]:
+    def _should_reflect(self, state: EvaState) -> Literal["continue", "reflect"]:
         """
-        Determine if we should continue acting or move to reflection.
+        Determine if we should continue working or move to reflection.
         
-        Continue acting if:
-        - There are more steps in the plan
-        - We haven't hit the step limit
+        Move to reflection if:
+        - Task appears complete
+        - Waiting for confirmation
+        - Need validation
         
         Args:
             state: Current conversation state
             
         Returns:
-            "continue" to keep acting, "reflect" to move to reflection
+            "continue" to keep working, "reflect" to validate
         """
-        # Check if there are more steps in the plan
-        if state["current_step"] < len(state["eva_plan"]):
-            logger.info(f"Continuing to act: step {state['current_step']} of {len(state['eva_plan'])}")
-            return "continue"
+        # Move to reflection if task appears complete
+        if state.get("response_ready", False):
+            logger.info("Task complete, moving to reflection")
+            return "reflect"
         
-        # All steps completed, move to reflection
-        logger.info("All plan steps completed, moving to reflection")
-        return "reflect"
+        # Move to reflection if waiting for confirmation
+        if state.get("needs_confirmation", False):
+            logger.info("Confirmation needed, moving to reflection")
+            return "reflect"
+        
+        # Continue working if task is not complete
+        logger.info("Task in progress, continuing meeting_agent work")
+        return "continue"
     
     def _should_end(self, state: EvaState) -> Literal["end", "continue"]:
         """
@@ -124,9 +128,8 @@ class EvaGraph:
             logger.info("Waiting for user confirmation, ending conversation")
             return "end"
         
-        # Continue if more actions are explicitly needed
-        # This is rare but can happen if reflection determines more work is needed
-        logger.info("Continuing processing based on reflection")
+        # Continue if reflection determines more work is needed
+        logger.info("Reflection determined more work needed, continuing")
         return "continue"
     
     async def process_message(
@@ -181,15 +184,12 @@ class EvaGraph:
             # Prepare response
             response = {
                 "response": eva_state.get("final_response", "I processed your request but couldn't generate a response."),
-                "conversation_id": eva_state.get("conversation_id", conversation_id),
+                "conversation_id": conversation_id,
                 "needs_confirmation": eva_state.get("needs_confirmation", False),
-                "confirmation_message": eva_state.get("confirmation_message", ""),
-                "request_type": eva_state.get("request_type", "unknown"),
                 "completed": eva_state.get("response_ready", True),
                 "metadata": {
-                    "plan_steps": len(eva_state.get("eva_plan", [])),
-                    "completed_steps": eva_state.get("current_step", 0),
-                    "tool_calls": len(eva_state.get("completed_tool_calls", []))
+                    "tool_calls": len(eva_state.get("tool_results", [])),
+                    "context": eva_state.get("context", {})
                 }
             }
             

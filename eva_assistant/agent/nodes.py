@@ -1,372 +1,216 @@
 """
-LangGraph node implementations for Eva Assistant.
+Eva Assistant LangGraph nodes.
 
-Contains the core reasoning nodes: plan, act, reflect that form Eva's decision-making process.
+Simplified structure with meeting_agent (with tools) and reflect (validation) nodes.
 """
 
 import json
 import logging
 from typing import Dict, Any, List
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from datetime import datetime
+
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 
-from eva_assistant.agent.state import EvaState, create_eva_state, complete_tool_call, update_context, set_confirmation_needed, set_final_response
-from eva_assistant.agent.prompts import (
-    get_planning_prompt, 
-    get_tool_execution_prompt, 
-    get_reflection_prompt,
-    EVA_PERSONALITY
-)
-from eva_assistant.config import settings
+from eva_assistant.agent.state import EvaState, add_tool_result, update_context, set_response
+from eva_assistant.agent.prompts import get_meeting_agent_prompt, get_reflection_prompt
 
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
-llm = ChatOpenAI(
-    model="gpt-4o",
-    temperature=0.1,
-    api_key=settings.openai_api_key
-)
+# Initialize LLM
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
-async def plan_node(state: EvaState) -> EvaState:
+async def meeting_agent_node(state: EvaState) -> EvaState:
     """
-    Planning node - Analyzes user request and creates execution plan.
+    Meeting agent node - handles the main logic with access to tools.
     
-    This node:
-    1. Analyzes the user's current request
-    2. Determines what type of request it is
-    3. Creates a step-by-step plan to fulfill the request
-    4. Identifies if confirmation will be needed
+    This node is Eva's main brain that:
+    - Analyzes the user's request
+    - Plans and executes tasks using available tools
+    - Handles calendar and email operations
+    - Prepares responses for confirmation
     
     Args:
         state: Current conversation state
         
     Returns:
-        Updated state with plan and request analysis
+        Updated state with results and response preparation
     """
-    logger.info(f"Planning node: Analyzing request '{state['current_request']}'")
+    logger.info(f"Meeting agent node: Processing request '{state.get('current_request', '')}'")
     
     try:
-        # Get the planning prompt with current context
-        planning_prompt = get_planning_prompt(state)
+        # Get the meeting agent prompt
+        prompt = get_meeting_agent_prompt(state)
         
         # Create messages for the LLM
         messages = [
-            SystemMessage(content=EVA_PERSONALITY),
-            HumanMessage(content=planning_prompt)
+            HumanMessage(content=prompt),
         ]
         
-        # Get plan from LLM
+        # Add conversation history if available
+        if state.get("messages"):
+            messages = state.get("messages", []) + messages
+        
+        # Call the LLM
         response = await llm.ainvoke(messages)
         
-        # Parse the JSON response
-        try:
-            plan_data = json.loads(response.content)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse planning response as JSON: {e}")
-            # Fallback to simple plan
-            plan_data = {
-                "request_type": "other",
-                "plan": [{"step": 1, "action": "respond_directly", "description": "Provide direct response"}],
-                "needs_confirmation": False,
-                "confidence": 0.5
-            }
+        # Parse the response and determine next actions
+        response_text = response.content
         
-        # Update state with plan
-        state["request_type"] = plan_data.get("request_type", "other")
-        state["eva_plan"] = plan_data.get("plan", [])
-        state["current_step"] = 0
+        # For now, simulate tool execution (mock implementation)
+        # In production, this would integrate with real tools
+        await _execute_mock_tools(state, response_text)
         
-        # Set confirmation if needed
-        if plan_data.get("needs_confirmation", False):
-            state["needs_confirmation"] = True
+        # Update state with the agent's work
+        state["final_response"] = response_text
         
-        logger.info(f"Plan created: {len(state['eva_plan'])} steps, type: {state['request_type']}")
+        # Determine if we need confirmation or if task is complete
+        needs_confirmation = "proceed?" in response_text.lower() or "okay to send?" in response_text.lower()
+        state["needs_confirmation"] = needs_confirmation
         
-        return state
-        
-    except Exception as e:
-        logger.error(f"Planning node error: {e}")
-        # Fallback plan
-        state["eva_plan"] = [{"step": 1, "action": "respond_directly", "description": "Provide direct response"}]
-        state["request_type"] = "error"
-        state["current_step"] = 0
-        
-        return state
-
-
-async def act_node(state: EvaState) -> EvaState:
-    """
-    Action node - Executes tools based on the current plan step.
-    
-    This node:
-    1. Takes the current step from the plan
-    2. Identifies which tools need to be called
-    3. Executes the tool calls
-    4. Stores results in state
-    5. Moves to next step or signals completion
-    
-    Args:
-        state: Current conversation state
-        
-    Returns:
-        Updated state with tool results and progress
-    """
-    logger.info(f"Action node: Executing step {state['current_step']}")
-    
-    if state["current_step"] >= len(state["eva_plan"]):
-        logger.info("All plan steps completed")
-        return state
-    
-    current_step_info = state["eva_plan"][state["current_step"]]
-    action = current_step_info.get("action", "")
-    
-    try:
-        # Execute different actions based on the plan
-        if action == "check_calendar_availability":
-            result = await _mock_check_calendar_availability(state)
-        elif action == "get_user_calendar_events":
-            result = await _mock_get_calendar_events(state)
-        elif action == "create_calendar_event":
-            result = await _mock_create_calendar_event(state)
-        elif action == "send_email":
-            result = await _mock_send_email(state)
-        elif action == "get_contact_info":
-            result = await _mock_get_contact_info(state)
-        elif action == "respond_directly":
-            result = await _generate_direct_response(state)
+        if needs_confirmation:
+            state["confirmation_message"] = response_text
+            logger.info("Meeting agent requesting confirmation from user")
         else:
-            logger.warning(f"Unknown action: {action}")
-            result = {"success": False, "error": f"Unknown action: {action}"}
+            state["response_ready"] = True
+            logger.info("Meeting agent completed task without confirmation needed")
         
-        # Store the tool result
-        call_id = f"{action}_{state['current_step']}"
-        complete_tool_call(state, call_id, result, result.get("success", True))
-        
-        # Move to next step
-        state["current_step"] += 1
-        
-        logger.info(f"Action completed: {action}, moving to step {state['current_step']}")
+        # Update messages
+        if "messages" not in state:
+            state["messages"] = []
+        state["messages"].append(HumanMessage(content=state.get("current_request", "")))
+        state["messages"].append(AIMessage(content=response_text))
         
         return state
         
     except Exception as e:
-        logger.error(f"Action node error: {e}")
+        logger.error(f"Error in meeting agent node: {e}")
         
-        # Record the error
-        call_id = f"{action}_{state['current_step']}"
-        complete_tool_call(state, call_id, {"error": str(e)}, False, str(e))
-        state["current_step"] += 1
+        # Fallback response
+        fallback_response = f"I apologize, but I encountered an issue while processing your request: {state.get('current_request', '')}. Could you please try rephrasing your request?"
+        
+        state["final_response"] = fallback_response
+        state["response_ready"] = True
+        state["request_type"] = "error"
         
         return state
+
+
+async def _execute_mock_tools(state: EvaState, response_text: str):
+    """
+    Mock tool execution for demonstration.
+    
+    In production, this would integrate with real calendar and email tools.
+    """
+    request = state.get("current_request", "").lower()
+    
+    # Simulate different tool calls based on request type
+    if "schedule" in request or "meeting" in request or "book" in request:
+        # Mock calendar operations
+        logger.info("Mock: Checking calendar availability")
+        add_tool_result(state, "calendar_check", {
+            "available_slots": ["Tomorrow 2:00-2:30 PM", "Tomorrow 3:00-3:30 PM"],
+            "conflicts": []
+        })
+        
+        logger.info("Mock: Creating calendar event")
+        add_tool_result(state, "calendar_create", {
+            "event_id": "mock_event_123",
+            "title": "Meeting",
+            "time": "Tomorrow 2:00-2:30 PM",
+            "link": "https://meet.google.com/mock-link"
+        })
+        
+        # Update context
+        update_context(state, "meeting_title", "Meeting")
+        update_context(state, "meeting_time", "Tomorrow 2:00-2:30 PM")
+        update_context(state, "meeting_status", "pending_confirmation")
+        
+    elif "email" in request or "send" in request:
+        # Mock email operations
+        logger.info("Mock: Sending email")
+        add_tool_result(state, "email_send", {
+            "message_id": "mock_email_456",
+            "to": "contact@example.com",
+            "subject": "Meeting Request",
+            "status": "sent"
+        })
+        
+        # Update context
+        update_context(state, "email_sent", True)
+        update_context(state, "email_recipient", "contact@example.com")
 
 
 async def reflect_node(state: EvaState) -> EvaState:
     """
-    Reflection node - Analyzes results and prepares final response.
+    Reflection node - validates the meeting agent's work.
     
     This node:
-    1. Reviews all completed tool calls and results
-    2. Determines if the request has been fulfilled
-    3. Checks if confirmation is needed
-    4. Prepares Eva's final response to the user
-    5. Decides if more actions are needed
+    - Reviews what the meeting agent accomplished
+    - Validates that the task was completed correctly
+    - Determines if more work is needed
+    - Finalizes the response
     
     Args:
         state: Current conversation state
         
     Returns:
-        Updated state with final response and completion status
+        Updated state with validation results
     """
     logger.info("Reflection node: Analyzing results and preparing response")
     
     try:
-        # Get reflection prompt with current context
-        reflection_prompt = get_reflection_prompt(state)
+        # Get reflection prompt
+        prompt = get_reflection_prompt(state)
         
-        # Create messages for the LLM
-        messages = [
-            SystemMessage(content=EVA_PERSONALITY),
-            HumanMessage(content=reflection_prompt)
-        ]
+        # Create messages for reflection
+        messages = [HumanMessage(content=prompt)]
         
-        # Get reflection from LLM
+        # Call the LLM for reflection
         response = await llm.ainvoke(messages)
+        reflection_text = response.content
         
-        # Parse the JSON response
+        # Try to parse as JSON for structured reflection
         try:
-            reflection_data = json.loads(response.content)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse reflection response as JSON: {e}")
-            # Fallback reflection
-            reflection_data = {
-                "success": True,
-                "needs_more_actions": False,
-                "needs_confirmation": False,
-                "final_response": "I've processed your request. How else can I help you?",
-                "confidence": 0.5
-            }
-        
-        # Update state based on reflection
-        if reflection_data.get("needs_confirmation", False):
-            set_confirmation_needed(state, reflection_data.get("confirmation_message", ""))
-        
-        if reflection_data.get("final_response"):
-            set_final_response(state, reflection_data["final_response"])
-        
-        # Determine if we're done
-        needs_more_actions = reflection_data.get("needs_more_actions", False)
-        
-        logger.info(f"Reflection complete: needs_more_actions={needs_more_actions}")
-        
-        return state
-        
-    except Exception as e:
-        logger.error(f"Reflection node error: {e}")
-        
-        # Fallback response
-        fallback_response = f"I apologize, but I encountered an issue while processing your request: {state['current_request']}. Could you please try rephrasing your request?"
-        set_final_response(state, fallback_response)
-        
-        return state
-
-
-# Mock tool implementations (will be replaced with real tools later)
-
-async def _mock_check_calendar_availability(state: EvaState) -> Dict[str, Any]:
-    """Mock calendar availability check."""
-    logger.info("Mock: Checking calendar availability")
-    
-    # Simulate checking availability
-    availability = {
-        "available_slots": [
-            {"start": "2024-01-15T14:00:00Z", "end": "2024-01-15T15:00:00Z"},
-            {"start": "2024-01-16T10:00:00Z", "end": "2024-01-16T11:00:00Z"},
-            {"start": "2024-01-17T13:00:00Z", "end": "2024-01-17T14:00:00Z"}
-        ],
-        "busy_times": [],
-        "timezone": "UTC"
-    }
-    
-    update_context(state, "calendar", availability)
-    
-    return {
-        "success": True,
-        "availability": availability,
-        "message": "Calendar availability checked successfully"
-    }
-
-
-async def _mock_get_calendar_events(state: EvaState) -> Dict[str, Any]:
-    """Mock getting calendar events."""
-    logger.info("Mock: Getting calendar events")
-    
-    events = [
-        {
-            "id": "event1",
-            "title": "Team Meeting",
-            "start": "2024-01-15T09:00:00Z",
-            "end": "2024-01-15T10:00:00Z"
-        },
-        {
-            "id": "event2",
-            "title": "Client Call",
-            "start": "2024-01-15T15:00:00Z",
-            "end": "2024-01-15T16:00:00Z"
-        }
-    ]
-    
-    update_context(state, "calendar", {"events": events})
-    
-    return {
-        "success": True,
-        "events": events,
-        "message": "Calendar events retrieved successfully"
-    }
-
-
-async def _mock_create_calendar_event(state: EvaState) -> Dict[str, Any]:
-    """Mock creating a calendar event."""
-    logger.info("Mock: Creating calendar event")
-    
-    meeting_context = state["meeting_context"]
-    
-    event = {
-        "id": "new_event_123",
-        "title": meeting_context.get("title", "New Meeting"),
-        "start": meeting_context.get("start_time", "2024-01-15T14:00:00Z"),
-        "end": meeting_context.get("end_time", "2024-01-15T15:00:00Z"),
-        "attendees": meeting_context.get("attendees", [])
-    }
-    
-    return {
-        "success": True,
-        "event": event,
-        "message": "Calendar event created successfully",
-        "event_id": event["id"]
-    }
-
-
-async def _mock_send_email(state: EvaState) -> Dict[str, Any]:
-    """Mock sending an email."""
-    logger.info("Mock: Sending email")
-    
-    email_context = state["email_context"]
-    
-    return {
-        "success": True,
-        "message": "Email sent successfully",
-        "recipients": email_context.get("recipients", []),
-        "subject": email_context.get("subject", "Meeting Request")
-    }
-
-
-async def _mock_get_contact_info(state: EvaState) -> Dict[str, Any]:
-    """Mock getting contact information."""
-    logger.info("Mock: Getting contact info")
-    
-    return {
-        "success": True,
-        "contacts": [
-            {"name": "John Smith", "email": "john@example.com"},
-            {"name": "Jane Doe", "email": "jane@example.com"}
-        ],
-        "message": "Contact information retrieved"
-    }
-
-
-async def _generate_direct_response(state: EvaState) -> Dict[str, Any]:
-    """Generate a direct response using LLM."""
-    logger.info("Generating direct response")
-    
-    try:
-        messages = [
-            SystemMessage(content=EVA_PERSONALITY),
-            HumanMessage(content=f"""
-                         Provide a helpful response to this request: {state['current_request']}
-             
-             Context:
-             - User: {state['user_id']}
-             - Calendar context: {state['calendar_context']}
-             - Meeting context: {state['meeting_context']}
+            reflection_data = json.loads(reflection_text)
             
-            Be professional, direct, and helpful. Provide clear next steps if applicable.
-            """)
-        ]
+            # Update state based on reflection
+            state["response_ready"] = not reflection_data.get("needs_more_work", False)
+            
+            if reflection_data.get("needs_more_work", False):
+                logger.info("Reflection determined more work is needed")
+                # Clear response_ready to continue working
+                state["response_ready"] = False
+                state["needs_confirmation"] = False
+            else:
+                logger.info("Reflection confirmed task is complete")
+                state["response_ready"] = True
+                
+                # Use refined response if provided
+                if reflection_data.get("final_response"):
+                    state["final_response"] = reflection_data["final_response"]
+                    
+        except json.JSONDecodeError:
+            # Fallback: simple text-based reflection
+            logger.info("Using text-based reflection analysis")
+            
+            if "incomplete" in reflection_text.lower() or "more work" in reflection_text.lower():
+                state["response_ready"] = False
+                state["needs_confirmation"] = False
+                logger.info("Text reflection: More work needed")
+            else:
+                state["response_ready"] = True
+                logger.info("Text reflection: Task complete")
         
-        response = await llm.ainvoke(messages)
-        
-        return {
-            "success": True,
-            "response": response.content,
-            "message": "Direct response generated"
-        }
+        logger.info(f"Reflection complete: response_ready={state.get('response_ready', False)}")
+        return state
         
     except Exception as e:
-        logger.error(f"Error generating direct response: {e}")
-        return {
-            "success": False,
-            "response": "I apologize, but I'm having trouble processing your request right now. Could you please try again?",
-            "error": str(e)
-        } 
+        logger.error(f"Error in reflection node: {e}")
+        
+        # Default to completing the task if reflection fails
+        state["response_ready"] = True
+        logger.info("Reflection failed, defaulting to task complete")
+        
+        return state 
