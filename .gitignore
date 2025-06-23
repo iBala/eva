@@ -3,3 +3,5 @@
 *.mdc
 .venv/
 oauth/
+data/
+.langgraph_api/

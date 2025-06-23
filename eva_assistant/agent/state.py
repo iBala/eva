@@ -4,31 +4,32 @@ Simplified LangGraph State definition for Eva Assistant.
 Minimal state structure for meeting_agent + reflect workflow.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 from typing_extensions import TypedDict
-from langchain_core.messages import BaseMessage
 
 
 class EvaState(TypedDict):
     """
     Simplified Eva Assistant conversation state.
     
-    Only contains essential fields for the meeting_agent + reflect workflow.
+    Essential fields for the meeting_agent + reflect workflow.
     """
     
-    # Core conversation
-    messages: List[BaseMessage]
+    # Core input
+    user_message: str
     user_id: str
-    current_request: str
     
-    # Response handling
+    # Meeting agent output
+    response: Optional[str]
+    tool_calls: Optional[list]
+    
+    # Reflect agent output
+    reflection_approved: Optional[bool]
     final_response: Optional[str]
-    needs_confirmation: Optional[bool]
-    response_ready: Optional[bool]
     
-    # Tool and context data
-    tool_results: Optional[List[Dict[str, Any]]]
-    context: Optional[Dict[str, Any]]
+    # Metadata
+    success: Optional[bool]
+    error: Optional[str]
 
 
 # Helper functions for working with simplified EvaState
@@ -40,14 +41,14 @@ def create_eva_state(
 ) -> EvaState:
     """Create a new simplified EvaState with default values."""
     return EvaState(
-        messages=[],
+        user_message="",
         user_id=user_id,
-        current_request=current_request,
+        response=None,
+        tool_calls=None,
+        reflection_approved=None,
         final_response=None,
-        needs_confirmation=False,
-        response_ready=False,
-        tool_results=[],
-        context={}
+        success=None,
+        error=None
     )
 
 

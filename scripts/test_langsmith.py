@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from eva_assistant.agent.graph import get_eva_graph
+from eva_assistant.agent.graph import get_eva_app
 from eva_assistant.agent.state import create_eva_state
 
 
@@ -28,7 +28,7 @@ async def test_eva_with_langsmith():
         print("⚠️  LANGCHAIN_API_KEY not set - tracing will be disabled")
     
     # Get the graph (this is what LangSmith will call)
-    graph = get_eva_graph()
+    graph = get_eva_app()
     print("✅ Graph loaded successfully")
     
     # Create test state

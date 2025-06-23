@@ -68,8 +68,13 @@ class Settings(BaseSettings):
     oauth_dir: Path = Path("./oauth")
     token_dir: Path = Path("./oauth/tokens")
     user_tokens_dir: Path = Path("./data/user_tokens")
+    eva_tokens_dir: Path = Path("./data/eva_tokens")
     
-    @field_validator('data_dir', 'oauth_dir', 'token_dir', 'user_tokens_dir')
+    # OAuth Configuration
+    oauth_port: int = 8080  # Standardized OAuth callback port for both Eva and users
+    oauth_timeout: int = 300  # OAuth flow timeout in seconds (5 minutes)
+    
+    @field_validator('data_dir', 'oauth_dir', 'token_dir', 'user_tokens_dir', 'eva_tokens_dir')
     @classmethod
     def create_directories(cls, v):
         """Ensure directories exist."""

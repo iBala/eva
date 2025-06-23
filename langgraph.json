@@ -4,7 +4,7 @@
   ],
   "graphs": {
     "eva_assistant": {
-      "path": "eva_assistant.agent.graph:get_eva_graph",
+      "path": "eva_assistant.agent.graph:get_eva_app",
       "description": "Eva - AI Executive Assistant for scheduling and calendar management",
       "config_schema": {
         "type": "object",

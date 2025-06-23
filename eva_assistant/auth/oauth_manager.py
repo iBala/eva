@@ -9,6 +9,7 @@ This module provides secure token management, automatic refresh, and
 multi-user calendar authentication.
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -177,7 +178,7 @@ class OAuthManager:
         logger.info(f"User {user_id} credentials ready")
         return creds
     
-    def connect_user_calendar(self, user_id: str) -> Dict[str, Any]:
+    async def connect_user_calendar(self, user_id: str) -> Dict[str, Any]:
         """
         Connect a user's calendar through OAuth flow.
         
@@ -195,11 +196,11 @@ class OAuthManager:
         # Get credentials (this will trigger OAuth flow if needed)
         creds = self.get_user_credentials(user_id)
         
-        # Get calendar service
-        service = build('calendar', 'v3', credentials=creds)
+        # Get calendar service - wrap blocking build() call in asyncio.to_thread()
+        service = await asyncio.to_thread(build, 'calendar', 'v3', credentials=creds)
         
-        # Get user's calendar list
-        calendar_list = service.calendarList().list().execute()
+        # Get user's calendar list - wrap blocking API call in asyncio.to_thread()
+        calendar_list = await asyncio.to_thread(service.calendarList().list().execute)
         calendars = calendar_list.get('items', [])
         
         # Get user's profile info
@@ -246,22 +247,22 @@ class OAuthManager:
             logger.info(f"No calendar connection found for user {user_id}")
             return False
     
-    def get_eva_gmail_service(self):
+    async def get_eva_gmail_service(self):
         """Get authenticated Gmail service for Eva's account."""
         creds = self.get_eva_credentials()
-        return build('gmail', 'v1', credentials=creds)
+        return await asyncio.to_thread(build, 'gmail', 'v1', credentials=creds)
     
-    def get_eva_calendar_service(self):
+    async def get_eva_calendar_service(self):
         """Get authenticated Calendar service for Eva's account."""
         creds = self.get_eva_credentials()
-        return build('calendar', 'v3', credentials=creds)
+        return await asyncio.to_thread(build, 'calendar', 'v3', credentials=creds)
     
-    def get_user_calendar_service(self, user_id: str):
+    async def get_user_calendar_service(self, user_id: str):
         """Get authenticated Calendar service for a user's account (READ-ONLY)."""
         creds = self.get_user_credentials(user_id)
-        return build('calendar', 'v3', credentials=creds)
+        return await asyncio.to_thread(build, 'calendar', 'v3', credentials=creds)
     
-    def test_eva_authentication(self) -> Dict[str, Any]:
+    async def test_eva_authentication(self) -> Dict[str, Any]:
         """
         Test Eva's authentication.
         
@@ -269,8 +270,8 @@ class OAuthManager:
             Dict containing authentication status and details
         """
         try:
-            eva_service = self.get_eva_gmail_service()
-            profile = eva_service.users().getProfile(userId='me').execute()
+            eva_service = await self.get_eva_gmail_service()
+            profile = await asyncio.to_thread(eva_service.users().getProfile(userId='me').execute)
             logger.info(f"Eva Gmail authentication successful: {profile.get('emailAddress')}")
             return {
                 'success': True,
@@ -285,7 +286,7 @@ class OAuthManager:
                 'message': 'Eva Gmail authentication failed'
             }
     
-    def test_user_authentication(self, user_id: str) -> Dict[str, Any]:
+    async def test_user_authentication(self, user_id: str) -> Dict[str, Any]:
         """
         Test a user's calendar authentication.
         
@@ -296,8 +297,8 @@ class OAuthManager:
             Dict containing authentication status and details
         """
         try:
-            user_service = self.get_user_calendar_service(user_id)
-            calendar_list = user_service.calendarList().list().execute()
+            user_service = await self.get_user_calendar_service(user_id)
+            calendar_list = await asyncio.to_thread(user_service.calendarList().list().execute)
             calendars = calendar_list.get('items', [])
             logger.info(f"User {user_id} calendar authentication successful: {len(calendars)} calendars found")
             return {

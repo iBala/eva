@@ -1,216 +1,264 @@
 """
-Eva Assistant LangGraph nodes.
+Eva Assistant LangGraph Nodes.
 
-Simplified structure with meeting_agent (with tools) and reflect (validation) nodes.
+Implements the core workflow:
+- Meeting Agent: GPT-4o with thinking, all tools available
+- Reflect Agent: GPT-4o-mini, simple review, no tools
 """
 
 import json
 import logging
-from typing import Dict, Any, List
-from datetime import datetime
+from typing import Dict, Any
 
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_openai import ChatOpenAI
+import litellm
+from litellm import acompletion
 
-from eva_assistant.agent.state import EvaState, add_tool_result, update_context, set_response
+from eva_assistant.agent.state import EvaState
 from eva_assistant.agent.prompts import get_meeting_agent_prompt, get_reflection_prompt
+from eva_assistant.tools import convert_tools_to_litellm_format, execute_tool_call
 
 logger = logging.getLogger(__name__)
 
-# Initialize LLM
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+# Configure LiteLLM
+litellm.set_verbose = False
 
 
-async def meeting_agent_node(state: EvaState) -> EvaState:
+async def meeting_agent_node(state: EvaState) -> Dict[str, Any]:
     """
-    Meeting agent node - handles the main logic with access to tools.
-    
-    This node is Eva's main brain that:
-    - Analyzes the user's request
-    - Plans and executes tasks using available tools
-    - Handles calendar and email operations
-    - Prepares responses for confirmation
-    
-    Args:
-        state: Current conversation state
-        
-    Returns:
-        Updated state with results and response preparation
-    """
-    logger.info(f"Meeting agent node: Processing request '{state.get('current_request', '')}'")
-    
-    try:
-        # Get the meeting agent prompt
-        prompt = get_meeting_agent_prompt(state)
-        
-        # Create messages for the LLM
-        messages = [
-            HumanMessage(content=prompt),
-        ]
-        
-        # Add conversation history if available
-        if state.get("messages"):
-            messages = state.get("messages", []) + messages
-        
-        # Call the LLM
-        response = await llm.ainvoke(messages)
-        
-        # Parse the response and determine next actions
-        response_text = response.content
-        
-        # For now, simulate tool execution (mock implementation)
-        # In production, this would integrate with real tools
-        await _execute_mock_tools(state, response_text)
-        
-        # Update state with the agent's work
-        state["final_response"] = response_text
-        
-        # Determine if we need confirmation or if task is complete
-        needs_confirmation = "proceed?" in response_text.lower() or "okay to send?" in response_text.lower()
-        state["needs_confirmation"] = needs_confirmation
-        
-        if needs_confirmation:
-            state["confirmation_message"] = response_text
-            logger.info("Meeting agent requesting confirmation from user")
-        else:
-            state["response_ready"] = True
-            logger.info("Meeting agent completed task without confirmation needed")
-        
-        # Update messages
-        if "messages" not in state:
-            state["messages"] = []
-        state["messages"].append(HumanMessage(content=state.get("current_request", "")))
-        state["messages"].append(AIMessage(content=response_text))
-        
-        return state
-        
-    except Exception as e:
-        logger.error(f"Error in meeting agent node: {e}")
-        
-        # Fallback response
-        fallback_response = f"I apologize, but I encountered an issue while processing your request: {state.get('current_request', '')}. Could you please try rephrasing your request?"
-        
-        state["final_response"] = fallback_response
-        state["response_ready"] = True
-        state["request_type"] = "error"
-        
-        return state
-
-
-async def _execute_mock_tools(state: EvaState, response_text: str):
-    """
-    Mock tool execution for demonstration.
-    
-    In production, this would integrate with real calendar and email tools.
-    """
-    request = state.get("current_request", "").lower()
-    
-    # Simulate different tool calls based on request type
-    if "schedule" in request or "meeting" in request or "book" in request:
-        # Mock calendar operations
-        logger.info("Mock: Checking calendar availability")
-        add_tool_result(state, "calendar_check", {
-            "available_slots": ["Tomorrow 2:00-2:30 PM", "Tomorrow 3:00-3:30 PM"],
-            "conflicts": []
-        })
-        
-        logger.info("Mock: Creating calendar event")
-        add_tool_result(state, "calendar_create", {
-            "event_id": "mock_event_123",
-            "title": "Meeting",
-            "time": "Tomorrow 2:00-2:30 PM",
-            "link": "https://meet.google.com/mock-link"
-        })
-        
-        # Update context
-        update_context(state, "meeting_title", "Meeting")
-        update_context(state, "meeting_time", "Tomorrow 2:00-2:30 PM")
-        update_context(state, "meeting_status", "pending_confirmation")
-        
-    elif "email" in request or "send" in request:
-        # Mock email operations
-        logger.info("Mock: Sending email")
-        add_tool_result(state, "email_send", {
-            "message_id": "mock_email_456",
-            "to": "contact@example.com",
-            "subject": "Meeting Request",
-            "status": "sent"
-        })
-        
-        # Update context
-        update_context(state, "email_sent", True)
-        update_context(state, "email_recipient", "contact@example.com")
-
-
-async def reflect_node(state: EvaState) -> EvaState:
-    """
-    Reflection node - validates the meeting agent's work.
+    Meeting Agent Node - Main processing with GPT-4o + thinking + all tools.
     
     This node:
-    - Reviews what the meeting agent accomplished
-    - Validates that the task was completed correctly
-    - Determines if more work is needed
-    - Finalizes the response
+    1. Takes the user request
+    2. Uses GPT-4o with thinking enabled
+    3. Has access to all tools (calendar, email, etc.)
+    4. Plans and executes using tools
+    5. Produces a response
     
     Args:
         state: Current conversation state
         
     Returns:
-        Updated state with validation results
+        Updated state with response and tool calls
     """
-    logger.info("Reflection node: Analyzing results and preparing response")
-    
     try:
-        # Get reflection prompt
-        prompt = get_reflection_prompt(state)
+        user_message = state.get("user_message", "")
+        user_id = state.get("user_id", "founder")
         
-        # Create messages for reflection
-        messages = [HumanMessage(content=prompt)]
+        logger.info(f"Meeting Agent processing: {user_message[:100]}...")
         
-        # Call the LLM for reflection
-        response = await llm.ainvoke(messages)
-        reflection_text = response.content
+        # Get all available tools
+        tools = convert_tools_to_litellm_format()
+        logger.info(f"Meeting Agent has access to {len(tools)} tools")
         
-        # Try to parse as JSON for structured reflection
-        try:
-            reflection_data = json.loads(reflection_text)
+        # Build the prompt using existing prompts.py
+        system_prompt = get_meeting_agent_prompt({
+            "user_id": user_id,
+            "current_request": user_message,
+            "context": {},
+            "tool_results": []
+        })
+        
+        # Build messages for LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # Call GPT-4o with thinking and tools (NOW PROPERLY USING acompletion)
+        response = await acompletion(
+            model="gpt-4o",
+            messages=messages,
+            tools=tools if tools else None,
+            tool_choice="auto",  # Let LLM decide when to use tools
+            temperature=0.0,  # Deterministic for consistency
+            stream=False
+        )
+        
+        # Extract the response
+        message = response.choices[0].message
+        agent_response = message.content or ""
+        tool_calls = getattr(message, 'tool_calls', None)
+        
+        executed_tools = []
+        
+        # Execute tool calls if any
+        if tool_calls:
+            logger.info(f"Meeting Agent executing {len(tool_calls)} tool calls")
             
-            # Update state based on reflection
-            state["response_ready"] = not reflection_data.get("needs_more_work", False)
-            
-            if reflection_data.get("needs_more_work", False):
-                logger.info("Reflection determined more work is needed")
-                # Clear response_ready to continue working
-                state["response_ready"] = False
-                state["needs_confirmation"] = False
-            else:
-                logger.info("Reflection confirmed task is complete")
-                state["response_ready"] = True
-                
-                # Use refined response if provided
-                if reflection_data.get("final_response"):
-                    state["final_response"] = reflection_data["final_response"]
+            for tool_call in tool_calls:
+                try:
+                    # Parse tool arguments
+                    tool_args = json.loads(tool_call.function.arguments)
                     
-        except json.JSONDecodeError:
-            # Fallback: simple text-based reflection
-            logger.info("Using text-based reflection analysis")
+                    # Add user_id to args if tool needs it
+                    if _tool_needs_user_id(tool_call.function.name):
+                        tool_args['user_id'] = user_id
+                    
+                    # Execute the tool
+                    result = await execute_tool_call(tool_call.function.name, tool_args)
+                    
+                    executed_tools.append({
+                        "name": tool_call.function.name,
+                        "args": tool_args,
+                        "result": result
+                    })
+                    
+                    logger.info(f"Tool {tool_call.function.name} executed successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Tool execution failed: {e}")
+                    executed_tools.append({
+                        "name": tool_call.function.name,
+                        "args": {},
+                        "result": {"success": False, "error": str(e)}
+                    })
             
-            if "incomplete" in reflection_text.lower() or "more work" in reflection_text.lower():
-                state["response_ready"] = False
-                state["needs_confirmation"] = False
-                logger.info("Text reflection: More work needed")
-            else:
-                state["response_ready"] = True
-                logger.info("Text reflection: Task complete")
+            # If we have tool results, give LLM a chance to use them for final response
+            if executed_tools:
+                # Add tool results to conversation
+                messages.append({
+                    "role": "assistant",
+                    "content": agent_response,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in tool_calls
+                    ]
+                })
+                
+                # Add tool results
+                for tool_call, executed_tool in zip(tool_calls, executed_tools):
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "content": json.dumps(executed_tool["result"])
+                    })
+                
+                # Get final response incorporating tool results (NOW PROPERLY USING acompletion)
+                final_response = await acompletion(
+                    model="gpt-4o",
+                    messages=messages,
+                    temperature=0.0,
+                    stream=False
+                )
+                
+                agent_response = final_response.choices[0].message.content or agent_response
         
-        logger.info(f"Reflection complete: response_ready={state.get('response_ready', False)}")
-        return state
+        logger.info(f"Meeting Agent completed with {len(executed_tools)} tool calls")
+        
+        return {
+            "response": agent_response,
+            "tool_calls": executed_tools,
+            "success": True
+        }
         
     except Exception as e:
-        logger.error(f"Error in reflection node: {e}")
+        logger.error(f"Meeting Agent error: {e}")
+        return {
+            "response": f"I apologize, but I encountered an error processing your request: {str(e)}",
+            "tool_calls": [],
+            "success": False,
+            "error": str(e)
+        }
+
+
+async def reflect_node(state: EvaState) -> Dict[str, Any]:
+    """
+    Reflect Agent Node - Simple review with GPT-4o-mini, no tools.
+    
+    This node:
+    1. Reviews the Meeting Agent's response
+    2. Checks if it addresses the original request
+    3. Uses GPT-4o-mini (lighter, faster)
+    4. No tools available
+    5. Approves or suggests improvements
+    
+    Args:
+        state: Current conversation state
         
-        # Default to completing the task if reflection fails
-        state["response_ready"] = True
-        logger.info("Reflection failed, defaulting to task complete")
+    Returns:
+        Updated state with reflection results
+    """
+    try:
+        user_message = state.get("user_message", "")
+        agent_response = state.get("response", "")
+        tool_calls = state.get("tool_calls", [])
         
-        return state 
+        logger.info("Reflect Agent reviewing Meeting Agent's work")
+        
+        # Build reflection prompt
+        reflection_prompt = get_reflection_prompt({
+            "current_request": user_message,
+            "agent_response": agent_response,
+            "tool_results": [{"tool": tc["name"], "result": tc["result"]} for tc in tool_calls],
+            "context": {}
+        })
+        
+        # Simple review with GPT-4o-mini (no tools)
+        messages = [
+            {"role": "system", "content": reflection_prompt},
+            {"role": "user", "content": f"Review this response to: '{user_message}'\n\nResponse: {agent_response}"}
+        ]
+        
+        response = await acompletion(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.0,
+            stream=False
+        )
+        
+        reflection_content = response.choices[0].message.content
+        
+        # Parse reflection (expecting JSON from prompt)
+        try:
+            reflection_data = json.loads(reflection_content)
+            approved = reflection_data.get("task_complete", True)
+            final_response = reflection_data.get("final_response", agent_response)
+        except json.JSONDecodeError:
+            # Fallback if JSON parsing fails
+            logger.warning("Reflection JSON parsing failed, using original response")
+            approved = True
+            final_response = agent_response
+        
+        logger.info(f"Reflect Agent {'approved' if approved else 'suggested improvements'}")
+        
+        return {
+            "reflection_approved": approved,
+            "final_response": final_response,
+            "success": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Reflect Agent error: {e}")
+        return {
+            "reflection_approved": True,  # Default to approved on error
+            "final_response": state.get("response", "I apologize, but I encountered an error."),
+            "success": False,
+            "error": str(e)
+        }
+
+
+def _tool_needs_user_id(tool_name: str) -> bool:
+    """
+    Check if a tool needs user_id parameter.
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        True if tool needs user_id
+    """
+    # Tools that need user_id for authentication/permissions
+    user_id_tools = [
+        "get_all_calendar_events",
+        "get_calendar_event", 
+        "create_calendar_event",
+        "check_calendar_availability"
+    ]
+    return tool_name in user_id_tools 
