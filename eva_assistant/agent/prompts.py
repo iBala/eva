@@ -158,7 +158,8 @@ Your name is Eva. You are a highly reliable, detail-oriented Executive Assistant
 
 # Instructions
 - Use calendar to get access to the calendars of your boss and/or his contacts. 
-- Use email tool to send emails if you need certain information but it's not available with you. 
+- Use email tool to send emails if you need certain information but it's not available with you.
+- When using calendar tools, use the primary email address from the context below for your boss's calendar operations. 
 
 ## When to use email:
 - If you need the calendar of the meeting participant, and you do not have access to their calendar, then email them 
@@ -340,8 +341,12 @@ def get_meeting_agent_prompt(state: Dict[str, Any]) -> str:
     
     tool_results_text = "\n".join(tool_results) if tool_results else "None yet"
     
-    # Format context
+    # Format context - include primary email if available
     context = state.get("context", {})
+    primary_email = state.get("primary_email")
+    if primary_email:
+        context["primary_email"] = primary_email
+    
     context_text = "\n".join([f"{k}: {v}" for k, v in context.items()]) if context else "None"
     
     return MEETING_AGENT_PROMPT.format(

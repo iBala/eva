@@ -102,6 +102,33 @@ class UserAuthManager:
         """
         return self.token_dir / f"user_{user_id}_profile.json"
     
+    def _get_user_email_mapping_file(self, user_id: str) -> Path:
+        """
+        Get the path to the user's email mapping file.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            Path to the email mapping JSON file
+        """
+        return self.token_dir / f"user_{user_id}_email_mapping.json"
+    
+    def _get_user_email_token_file(self, user_id: str, email: str) -> Path:
+        """
+        Get the path to the user's token file for a specific email.
+        
+        Args:
+            user_id: Unique identifier for the user
+            email: Email address
+            
+        Returns:
+            Path to the token JSON file for this email
+        """
+        # Sanitize email for filename
+        safe_email = email.replace('@', '_at_').replace('.', '_dot_')
+        return self.token_dir / f"user_{user_id}_{safe_email}_calendar_token.json"
+    
     def _load_user_credentials(self, user_id: str) -> Optional[Credentials]:
         """
         Load credentials for a specific user.
@@ -884,6 +911,7 @@ class UserAuthManager:
     def disconnect_user_calendar(self, user_id: str) -> bool:
         """
         Disconnect a user's calendar by removing their token and calendar selection.
+        Handles both legacy and new token file naming conventions.
         
         Args:
             user_id: Unique identifier for the user
@@ -892,54 +920,201 @@ class UserAuthManager:
             True if disconnection was successful, False otherwise
         """
         try:
-            token_file = self._get_user_token_file(user_id)
-            selection_file = self._get_user_calendar_selection_file(user_id)
+            logger.info(f"=== DISCONNECT_USER_CALENDAR DEBUG for {user_id} ===")
             
-            # Load credentials to revoke them
-            creds = self._load_user_credentials(user_id)
+            # Files to potentially remove
+            files_to_remove = []
+            
+            # 1. New system token file (current naming convention)
+            new_token_file = self._get_user_token_file(user_id)
+            files_to_remove.append(("new_token_file", new_token_file))
+            
+            # 2. Legacy system token file (actual pattern found in filesystem)
+            legacy_token_file = self.token_dir / f"user_{user_id}_token.json"
+            files_to_remove.append(("legacy_token_file", legacy_token_file))
+            
+            # 3. Calendar selection file
+            selection_file = self._get_user_calendar_selection_file(user_id)
+            files_to_remove.append(("selection_file", selection_file))
+            
+            # 4. User profile file (timezone, working hours, etc.)
+            profile_file = self._get_user_profile_file(user_id)
+            files_to_remove.append(("profile_file", profile_file))
+            
+            # 5. Email mapping file (new email-first system)
+            email_mapping_file = self._get_user_email_mapping_file(user_id)
+            files_to_remove.append(("email_mapping_file", email_mapping_file))
+            
+            # 6. Email-specific token files (if any exist)
+            email_token_files = list(self.token_dir.glob(f"user_{user_id}_*_at_*_calendar_token.json"))
+            for email_token_file in email_token_files:
+                files_to_remove.append(("email_token_file", email_token_file))
+            
+            logger.info(f"Files to check for removal: {len(files_to_remove)}")
+            for file_type, file_path in files_to_remove:
+                logger.info(f"  {file_type}: {file_path} (exists: {file_path.exists()})")
+            
+            # Load credentials to revoke them (try both naming conventions)
+            creds = None
+            
+            # Try new system first
+            if new_token_file.exists():
+                logger.info(f"Found new system token file: {new_token_file}")
+                creds = self._load_user_credentials(user_id)
+            elif legacy_token_file.exists():
+                logger.info(f"Found legacy system token file: {legacy_token_file}")
+                # Load legacy credentials manually
+                try:
+                    from google.oauth2.credentials import Credentials
+                    creds = Credentials.from_authorized_user_file(
+                        str(legacy_token_file), 
+                        self.scopes
+                    )
+                    logger.info(f"Successfully loaded legacy credentials for user {user_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to load legacy credentials for user {user_id}: {e}")
+            
+            # Revoke credentials if found
             if creds:
                 try:
-                    creds.revoke(Request())
-                    logger.info(f"Revoked credentials for user {user_id}")
+                    from google.auth.transport.requests import Request
+                    # Use the correct revoke method
+                    if hasattr(creds, 'revoke'):
+                        creds.revoke(Request())
+                    else:
+                        # For older credential objects, we can make a revoke request manually
+                        import requests
+                        revoke_url = f"https://oauth2.googleapis.com/revoke?token={creds.token}"
+                        response = requests.post(revoke_url)
+                        if response.status_code == 200:
+                            logger.info(f"✅ Successfully revoked credentials via API for user {user_id}")
+                        else:
+                            logger.warning(f"⚠️ Failed to revoke credentials via API for user {user_id}: {response.status_code}")
+                    logger.info(f"✅ Successfully revoked credentials for user {user_id}")
                 except Exception as e:
-                    logger.warning(f"Failed to revoke credentials for user {user_id}: {e}")
+                    logger.warning(f"⚠️ Failed to revoke credentials for user {user_id}: {e}")
+                    # Continue with file removal even if revocation fails
+            else:
+                logger.info(f"No credentials found to revoke for user {user_id}")
             
-            # Remove token file
-            if token_file.exists():
-                token_file.unlink()
-                logger.info(f"Removed token file for user {user_id}")
+            # Remove all existing files
+            removed_files = []
+            for file_type, file_path in files_to_remove:
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        removed_files.append(f"{file_type}: {file_path}")
+                        logger.info(f"✅ Removed {file_type}: {file_path}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to remove {file_type} {file_path}: {e}")
+                else:
+                    logger.info(f"⏭️ {file_type} does not exist: {file_path}")
             
-            # Remove calendar selection file
-            if selection_file.exists():
-                selection_file.unlink()
-                logger.info(f"Removed calendar selection file for user {user_id}")
+            logger.info(f"=== DISCONNECT SUMMARY for {user_id} ===")
+            logger.info(f"Total files removed: {len(removed_files)}")
+            for removed_file in removed_files:
+                logger.info(f"  ✅ {removed_file}")
             
-            return True
+            # Return True if we removed at least one file or if no files existed
+            success = len(removed_files) > 0 or all(not f[1].exists() for f in files_to_remove)
+            logger.info(f"Disconnect success: {success}")
+            
+            return success
+            
         except Exception as e:
             logger.error(f"Failed to disconnect calendar for user {user_id}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
     
     def list_connected_users(self) -> List[str]:
         """
         List all users who have connected their calendars.
+        This method checks for users with valid token files (both legacy and new systems).
         
         Returns:
-            List of user IDs who have valid token files
+            List of user IDs with valid token files
         """
-        user_ids = []
+        user_ids = set()
+        
         try:
-            for token_file in self.token_dir.glob("user_*_calendar_token.json"):
-                # Extract user_id from filename
+            logger.info("=== LIST_CONNECTED_USERS DEBUG ===")
+            
+            # Method 1: Look for email mapping files to find users (new system)
+            email_mapping_users = set()
+            for mapping_file in self.token_dir.glob("user_*_email_mapping.json"):
+                filename = mapping_file.stem  # removes .json
+                if filename.startswith("user_") and filename.endswith("_email_mapping"):
+                    user_id = filename[5:-14]  # Remove "user_" prefix and "_email_mapping" suffix
+                    email_mapping_users.add(user_id)
+            
+            logger.info(f"Found {len(email_mapping_users)} users with email mappings: {list(email_mapping_users)}")
+            
+            # For email mapping users, check if they have any valid token files
+            for user_id in email_mapping_users:
+                has_valid_tokens = self.has_any_connected_calendars(user_id)
+                logger.info(f"User {user_id} has valid tokens: {has_valid_tokens}")
+                if has_valid_tokens:
+                    user_ids.add(user_id)
+            
+            # Method 2: Legacy support - look for old-style token files
+            legacy_users = set()
+            for token_file in self.token_dir.glob("user_*_token.json"):
+                # Skip email-specific token files (they have _at_ in them)
+                if "_at_" in token_file.name:
+                    continue
+                    
                 filename = token_file.stem  # removes .json
                 parts = filename.split('_')
-                if len(parts) >= 3:  # user_{user_id}_calendar
-                    user_id = '_'.join(parts[1:-1])  # everything between 'user' and 'calendar'
-                    user_ids.append(user_id)
+                if len(parts) >= 3:  # user_{user_id}_token
+                    user_id = '_'.join(parts[1:-1])  # everything between 'user' and 'token'
+                    legacy_users.add(user_id)
             
-            logger.info(f"Found {len(user_ids)} connected users")
-            return user_ids
+            logger.info(f"Found {len(legacy_users)} users with legacy token files: {list(legacy_users)}")
+            
+            # For legacy users, check if token file exists and is valid
+            for user_id in legacy_users:
+                legacy_token_file = self.token_dir / f"user_{user_id}_token.json"
+                if legacy_token_file.exists() and legacy_token_file.stat().st_size > 0:
+                    logger.info(f"Legacy user {user_id} has valid token file")
+                    user_ids.add(user_id)
+                else:
+                    logger.info(f"Legacy user {user_id} has invalid/empty token file")
+            
+            # Method 3: Check for new system token files (current naming convention)
+            new_system_users = set()
+            for token_file in self.token_dir.glob("user_*_calendar_token.json"):
+                # Skip email-specific token files (they have _at_ in them)
+                if "_at_" in token_file.name:
+                    continue
+                    
+                filename = token_file.stem  # removes .json
+                parts = filename.split('_')
+                if len(parts) >= 3:  # user_{user_id}_calendar_token
+                    user_id = '_'.join(parts[1:-2])  # everything between 'user' and 'calendar_token'
+                    new_system_users.add(user_id)
+            
+            logger.info(f"Found {len(new_system_users)} users with new system token files: {list(new_system_users)}")
+            
+            # For new system users, check if token file exists and is valid
+            for user_id in new_system_users:
+                new_token_file = self._get_user_token_file(user_id)
+                if new_token_file.exists() and new_token_file.stat().st_size > 0:
+                    logger.info(f"New system user {user_id} has valid token file")
+                    user_ids.add(user_id)
+                else:
+                    logger.info(f"New system user {user_id} has invalid/empty token file")
+            
+            logger.info(f"=== LIST_CONNECTED_USERS SUMMARY ===")
+            logger.info(f"Total connected users: {len(user_ids)}")
+            logger.info(f"Connected users: {list(user_ids)}")
+            
+            return list(user_ids)
+            
         except Exception as e:
             logger.error(f"Failed to list connected users: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
     
     def get_user_auth_status(self, user_id: str) -> Dict[str, Any]:
@@ -1251,4 +1426,389 @@ class UserAuthManager:
                 'available': False,
                 'error': str(e),
                 'timezone': self.get_user_timezone(user_id)
-            } 
+            }
+    
+    def get_user_email_mapping(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get the user's email mapping configuration.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            Email mapping dictionary
+        """
+        mapping_file = self._get_user_email_mapping_file(user_id)
+        
+        # Default mapping
+        default_mapping = {
+            'user_id': user_id,
+            'primary_email': None,
+            'owned_emails': [],
+            'email_to_token_mapping': {},
+            'created_at': str(datetime.utcnow().isoformat()),
+            'updated_at': str(datetime.utcnow().isoformat())
+        }
+        
+        if not mapping_file.exists():
+            logger.info(f"No email mapping file for user {user_id}, returning default")
+            return default_mapping
+        
+        try:
+            with open(mapping_file, 'r') as f:
+                mapping_data = json.load(f)
+                # Merge with defaults to ensure all fields exist
+                merged_mapping = {**default_mapping, **mapping_data}
+                logger.info(f"Loaded email mapping for user {user_id}: {len(merged_mapping.get('owned_emails', []))} emails")
+                return merged_mapping
+        except Exception as e:
+            logger.error(f"Failed to load email mapping for user {user_id}: {e}")
+            return default_mapping
+    
+    def save_user_email_mapping(self, user_id: str, mapping: Dict[str, Any]) -> bool:
+        """
+        Save the user's email mapping configuration.
+        
+        Args:
+            user_id: Unique identifier for the user
+            mapping: Email mapping dictionary
+            
+        Returns:
+            True if mapping was saved successfully, False otherwise
+        """
+        try:
+            mapping['updated_at'] = str(datetime.utcnow().isoformat())
+            mapping_file = self._get_user_email_mapping_file(user_id)
+            
+            # Ensure directory exists
+            mapping_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(mapping_file, 'w') as f:
+                json.dump(mapping, f, indent=2)
+            
+            logger.info(f"Saved email mapping for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save email mapping for user {user_id}: {e}")
+            return False
+    
+    def find_user_id_for_email(self, email: str) -> Optional[str]:
+        """
+        Find which user_id owns the specified email address.
+        
+        This method first checks email mappings (new system), then falls back to
+        checking calendar selection files (legacy system compatibility).
+        
+        Args:
+            email: Email address to look up
+            
+        Returns:
+            user_id that owns this email, or None if not found
+        """
+        logger.info(f"=== FIND_USER_ID_FOR_EMAIL DEBUG: {email} ===")
+        
+        # Method 1: Search through email mappings (new system)
+        logger.info("Method 1: Checking email mappings...")
+        for user_id in self.list_connected_users():
+            mapping = self.get_user_email_mapping(user_id)
+            owned_emails = mapping.get('owned_emails', [])
+            logger.debug(f"User {user_id} owned emails: {owned_emails}")
+            
+            if email in owned_emails:
+                logger.info(f"✅ Found email {email} owned by user {user_id} via email mapping")
+                return user_id
+        
+        logger.info("Method 1 failed: Email not found in any email mappings")
+        
+        # Method 2: Fallback - Check calendar selection files (legacy system)
+        logger.info("Method 2: Checking calendar selection files (legacy fallback)...")
+        for user_id in self.list_connected_users():
+            try:
+                selected_calendars = self.get_user_selected_calendars(user_id)
+                logger.debug(f"User {user_id} selected calendars: {selected_calendars}")
+                
+                # Check if the email appears as a selected calendar ID
+                # (Google Calendar IDs are often email addresses for owned calendars)
+                if email in selected_calendars:
+                    logger.info(f"✅ Found email {email} as selected calendar for user {user_id} (legacy fallback)")
+                    
+                    # Auto-migrate: Create email mapping for this user
+                    logger.info(f"Auto-migrating user {user_id} to email-first system...")
+                    success = self._auto_migrate_legacy_user_to_email_system(user_id, email)
+                    if success:
+                        logger.info(f"✅ Successfully auto-migrated user {user_id}")
+                    else:
+                        logger.warning(f"⚠️ Auto-migration failed for user {user_id}")
+                    
+                    return user_id
+                    
+            except Exception as e:
+                logger.warning(f"Failed to check calendar selection for user {user_id}: {e}")
+                continue
+        
+        logger.info(f"Method 2 failed: Email {email} not found in any calendar selections")
+        logger.info(f"❌ Email {email} not found in any user mappings or calendar selections")
+        return None
+    
+    def _auto_migrate_legacy_user_to_email_system(self, user_id: str, email: str) -> bool:
+        """
+        Auto-migrate a legacy user to the email-first system by creating email mapping.
+        
+        Args:
+            user_id: User ID to migrate
+            email: Email address found in their calendar selection
+            
+        Returns:
+            True if migration was successful, False otherwise
+        """
+        try:
+            logger.info(f"=== AUTO-MIGRATING USER {user_id} ===")
+            
+            # Get existing email mapping (or create default)
+            mapping = self.get_user_email_mapping(user_id)
+            
+            # Add email to owned emails if not already present
+            owned_emails = mapping.get('owned_emails', [])
+            if email not in owned_emails:
+                owned_emails.append(email)
+                mapping['owned_emails'] = owned_emails
+                logger.info(f"Added {email} to owned emails for user {user_id}")
+            
+            # Set as primary email if no primary email is set
+            if not mapping.get('primary_email'):
+                mapping['primary_email'] = email
+                logger.info(f"Set {email} as primary email for user {user_id}")
+            
+            # Create token mapping entry pointing to existing token file
+            token_mapping = mapping.get('email_to_token_mapping', {})
+            if email not in token_mapping:
+                # Point to the existing legacy token file
+                legacy_token_file = self._get_user_token_file(user_id)
+                if legacy_token_file.exists():
+                    token_mapping[email] = str(legacy_token_file)
+                    mapping['email_to_token_mapping'] = token_mapping
+                    logger.info(f"Mapped {email} to existing token file: {legacy_token_file}")
+            
+            # Save the updated mapping
+            success = self.save_user_email_mapping(user_id, mapping)
+            if success:
+                logger.info(f"✅ Successfully auto-migrated user {user_id} to email-first system")
+                logger.info(f"  - Email: {email}")
+                logger.info(f"  - Primary: {mapping.get('primary_email')}")
+                logger.info(f"  - Token file: {token_mapping.get(email, 'N/A')}")
+                return True
+            else:
+                logger.error(f"❌ Failed to save email mapping for user {user_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Auto-migration failed for user {user_id}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+    
+    def get_owned_emails_for_user(self, user_id: str) -> List[str]:
+        """
+        Get all email addresses owned by a user.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            List of email addresses owned by this user
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        return mapping.get('owned_emails', [])
+    
+    def get_primary_email_for_user(self, user_id: str) -> Optional[str]:
+        """
+        Get the primary email address for a user.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            Primary email address, or None if not set
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        return mapping.get('primary_email')
+    
+    def set_primary_email_for_user(self, user_id: str, email: str) -> bool:
+        """
+        Set the primary email address for a user.
+        
+        Args:
+            user_id: Unique identifier for the user
+            email: Email address to set as primary
+            
+        Returns:
+            True if primary email was set successfully, False otherwise
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        
+        # Verify email is owned by this user
+        if email not in mapping.get('owned_emails', []):
+            logger.error(f"Cannot set primary email {email} for user {user_id}: email not owned")
+            return False
+        
+        mapping['primary_email'] = email
+        return self.save_user_email_mapping(user_id, mapping)
+    
+    def add_email_to_user(self, user_id: str, email: str, token_file_path: str) -> bool:
+        """
+        Add an email address to a user's owned emails.
+        
+        Args:
+            user_id: Unique identifier for the user
+            email: Email address to add
+            token_file_path: Path to the token file for this email
+            
+        Returns:
+            True if email was added successfully, False otherwise
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        
+        # Add email if not already present
+        if email not in mapping.get('owned_emails', []):
+            mapping.setdefault('owned_emails', []).append(email)
+        
+        # Update token mapping
+        mapping.setdefault('email_to_token_mapping', {})[email] = token_file_path
+        
+        # Set as primary if it's the first email
+        if not mapping.get('primary_email'):
+            mapping['primary_email'] = email
+        
+        return self.save_user_email_mapping(user_id, mapping)
+    
+    def remove_email_from_user(self, user_id: str, email: str) -> bool:
+        """
+        Remove an email address from a user's owned emails.
+        
+        Args:
+            user_id: Unique identifier for the user
+            email: Email address to remove
+            
+        Returns:
+            True if email was removed successfully, False otherwise
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        
+        # Remove from owned emails
+        owned_emails = mapping.get('owned_emails', [])
+        if email in owned_emails:
+            owned_emails.remove(email)
+        
+        # Remove from token mapping
+        email_to_token = mapping.get('email_to_token_mapping', {})
+        if email in email_to_token:
+            del email_to_token[email]
+        
+        # Update primary email if it was the removed email
+        if mapping.get('primary_email') == email:
+            mapping['primary_email'] = owned_emails[0] if owned_emails else None
+        
+        return self.save_user_email_mapping(user_id, mapping)
+    
+    async def get_calendar_service_for_email(self, email: str):
+        """
+        Get Calendar service for a specific email address.
+        
+        Args:
+            email: Email address to get service for
+            
+        Returns:
+            Google Calendar API service object for the email
+            
+        Raises:
+            Exception: If email is not connected or credentials are invalid
+        """
+        # Find user_id that owns this email
+        user_id = self.find_user_id_for_email(email)
+        if not user_id:
+            raise Exception(f"Calendar not connected for email {email}")
+        
+        # Get token file for this email
+        mapping = self.get_user_email_mapping(user_id)
+        token_mapping = mapping.get('email_to_token_mapping', {})
+        
+        if email not in token_mapping:
+            raise Exception(f"No token file found for email {email}")
+        
+        token_file_path = token_mapping[email]
+        token_file = Path(token_file_path)
+        
+        if not token_file.exists():
+            raise Exception(f"Token file does not exist for email {email}: {token_file_path}")
+        
+        # Load credentials from the specific token file
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_file), self.scopes)
+            
+            # Refresh if needed
+            if creds.expired and creds.refresh_token:
+                await asyncio.to_thread(creds.refresh, Request())
+                # Save refreshed credentials
+                with open(token_file, 'w') as f:
+                    f.write(creds.to_json())
+            
+            # Build and return service
+            service = await asyncio.to_thread(
+                build, 'calendar', 'v3', credentials=creds, cache_discovery=False
+            )
+            logger.info(f"Calendar service created for email {email}")
+            return service
+            
+        except Exception as e:
+            logger.error(f"Failed to create calendar service for email {email}: {e}")
+            raise
+    
+    def get_user_self_calendars_for_email(self, email: str) -> List[str]:
+        """
+        Get the list of calendar IDs that are considered 'self' calendars for an email.
+        These are the calendars selected by the user for availability checking.
+        
+        Args:
+            email: Email address
+            
+        Returns:
+            List of calendar IDs considered as 'self' calendars
+        """
+        # Find user_id that owns this email
+        user_id = self.find_user_id_for_email(email)
+        if not user_id:
+            return []
+        
+        # Get user's selected calendars (these are considered 'self' calendars)
+        selected_calendars = self.get_user_selected_calendars(user_id)
+        
+        # Filter to only calendars that belong to this specific email
+        # Note: This assumes calendar IDs are email addresses for owned calendars
+        email_calendars = [cal_id for cal_id in selected_calendars if cal_id == email or cal_id.startswith(email)]
+        
+        logger.info(f"Found {len(email_calendars)} self calendars for email {email}")
+        return email_calendars
+    
+    def has_any_connected_calendars(self, user_id: str) -> bool:
+        """
+        Check if a user has any connected calendars.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            True if user has any connected calendars, False otherwise
+        """
+        mapping = self.get_user_email_mapping(user_id)
+        owned_emails = mapping.get('owned_emails', [])
+        
+        # Check if any email has a valid token file
+        for email in owned_emails:
+            token_mapping = mapping.get('email_to_token_mapping', {})
+            if email in token_mapping:
+                token_file = Path(token_mapping[email])
+                if token_file.exists() and token_file.stat().st_size > 0:
+                    return True
+        
+        return False 

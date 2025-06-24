@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     user_tokens_dir: Path = Path("./data/user_tokens")
     eva_tokens_dir: Path = Path("./data/eva_tokens")
     
+    # Conversation Management Configuration - NEW: Added for conversation history
+    conversation_db_path: str = "data/conversations.db"
+    conversation_message_limit: int = 10  # Maximum historical messages to include in context
+    conversation_cleanup_enabled: bool = False  # Future feature for cleanup
+    
     # OAuth Configuration
     oauth_port: int = 8080  # Standardized OAuth callback port for both Eva and users
     oauth_timeout: int = 300  # OAuth flow timeout in seconds (5 minutes)

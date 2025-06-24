@@ -16,6 +16,7 @@ from litellm import acompletion
 from eva_assistant.agent.state import EvaState
 from eva_assistant.agent.prompts import get_meeting_agent_prompt, get_reflection_prompt
 from eva_assistant.tools import convert_tools_to_litellm_format, execute_tool_call
+from eva_assistant.auth.user_auth import UserAuthManager
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +26,17 @@ litellm.set_verbose = False
 
 async def meeting_agent_node(state: EvaState) -> Dict[str, Any]:
     """
-    Meeting Agent Node - Main processing with GPT-4o + thinking + all tools.
+    Enhanced Meeting Agent Node - Main processing with GPT-4o + thinking + all tools + conversation history.
     
     This node:
-    1. Takes the user request
+    1. Takes the user request and conversation history
     2. Uses GPT-4o with thinking enabled
     3. Has access to all tools (calendar, email, etc.)
-    4. Plans and executes using tools
+    4. Plans and executes using tools with conversation context
     5. Produces a response
     
     Args:
-        state: Current conversation state
+        state: Current conversation state with conversation history
         
     Returns:
         Updated state with response and tool calls
@@ -43,26 +44,53 @@ async def meeting_agent_node(state: EvaState) -> Dict[str, Any]:
     try:
         user_message = state.get("user_message", "")
         user_id = state.get("user_id", "founder")
+        conversation_id = state.get("conversation_id")
+        historical_messages = state.get("messages", [])
         
         logger.info(f"Meeting Agent processing: {user_message[:100]}...")
+        logger.info(f"Conversation ID: {conversation_id}")
+        logger.info(f"Historical messages: {len(historical_messages)}")
+        
+        # Get user's primary email for context
+        user_auth = UserAuthManager()
+        primary_email = user_auth.get_primary_email_for_user(user_id)
+        primary_user_timezone = user_auth.get_user_timezone(user_id)
+        
+        logger.info(f"User {user_id} primary email: {primary_email}")
+        logger.info(f"User {user_id} primary timezone: {primary_user_timezone}")
+        
+        # Build primary user context for tools
+        primary_user_context = {
+            "user_id": user_id,
+            "primary_email": primary_email,
+            "primary_timezone": primary_user_timezone
+        }
         
         # Get all available tools
         tools = convert_tools_to_litellm_format()
         logger.info(f"Meeting Agent has access to {len(tools)} tools")
         
-        # Build the prompt using existing prompts.py
+        # Build the prompt using existing prompts.py with primary email context
         system_prompt = get_meeting_agent_prompt({
             "user_id": user_id,
+            "primary_email": primary_email,  # Add primary email to context
             "current_request": user_message,
             "context": {},
             "tool_results": []
         })
         
-        # Build messages for LLM
+        # Build messages for LLM - ENHANCED: Include conversation history
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
+            {"role": "system", "content": system_prompt}
         ]
+        
+        # Add historical messages for context (if any)
+        if historical_messages:
+            logger.info(f"Adding {len(historical_messages)} historical messages to context")
+            messages.extend(historical_messages)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
         
         # Call GPT-4o with thinking and tools (NOW PROPERLY USING acompletion)
         response = await acompletion(
@@ -95,7 +123,7 @@ async def meeting_agent_node(state: EvaState) -> Dict[str, Any]:
                         tool_args['user_id'] = user_id
                     
                     # Execute the tool
-                    result = await execute_tool_call(tool_call.function.name, tool_args)
+                    result = await execute_tool_call(tool_call.function.name, tool_args, primary_user_context)
                     
                     executed_tools.append({
                         "name": tool_call.function.name,

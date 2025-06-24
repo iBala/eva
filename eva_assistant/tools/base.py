@@ -105,13 +105,15 @@ def convert_tools_to_litellm_format() -> List[Dict[str, Any]]:
     return tools
 
 
-async def execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+async def execute_tool_call(tool_name: str, tool_args: Dict[str, Any], 
+                          primary_user_context: Dict[str, Any] = None) -> Dict[str, Any]:
     """
-    Execute a tool call with the given arguments.
+    Execute a tool call with the given arguments and optional primary user context.
     
     Args:
         tool_name: Name of the tool to execute
         tool_args: Arguments to pass to the tool
+        primary_user_context: Optional context about the primary user (timezone, email, etc.)
         
     Returns:
         Tool execution result
@@ -128,8 +130,13 @@ async def execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict[s
         # Validate arguments using the tool's schema
         validated_args = tool.schema(**tool_args)
         
-        # Execute the tool
-        result = await tool.run(validated_args)
+        # Execute the tool with optional context
+        if primary_user_context and hasattr(tool, 'run_with_context'):
+            # Tool supports context - pass it along
+            result = await tool.run_with_context(validated_args, primary_user_context)
+        else:
+            # Standard tool execution
+            result = await tool.run(validated_args)
         
         # Ensure result is serializable
         if not isinstance(result, dict):

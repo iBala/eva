@@ -64,14 +64,16 @@ class EvaGraph:
         return self.graph
     
     async def process_message(self, user_message: str, user_id: str = "founder",
+                            conversation_id: Optional[str] = None,
                             conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
-        Process a user message through the graph.
+        Process a user message through the graph with conversation history.
         
         Args:
             user_message: The user's message
             user_id: User identifier
-            conversation_history: Previous conversation messages (not used in current flow)
+            conversation_id: Conversation identifier for context
+            conversation_history: Previous conversation messages for context
             
         Returns:
             Processing result with response and metadata
@@ -79,10 +81,13 @@ class EvaGraph:
         if not self.graph:
             self.build()
         
-        # Create initial state
+        # Create initial state with conversation context
         initial_state = {
             "user_message": user_message,
             "user_id": user_id,
+            "conversation_id": conversation_id,
+            "messages": conversation_history or [],
+            "is_new_conversation": conversation_history is None or len(conversation_history) == 0,
             "response": None,
             "tool_calls": None,
             "reflection_approved": None,
@@ -103,14 +108,16 @@ class EvaGraph:
         }
     
     async def stream_message(self, user_message: str, user_id: str = "founder",
+                           conversation_id: Optional[str] = None,
                            conversation_history: Optional[List[Dict[str, str]]] = None):
         """
-        Stream a response to user message.
+        Stream a response to user message with conversation history.
         
         Args:
             user_message: The user's message
             user_id: User identifier
-            conversation_history: Previous conversation messages
+            conversation_id: Conversation identifier for context
+            conversation_history: Previous conversation messages for context
             
         Yields:
             Streaming response chunks
@@ -118,10 +125,13 @@ class EvaGraph:
         if not self.graph:
             self.build()
         
-        # Create initial state
+        # Create initial state with conversation context
         initial_state = {
             "user_message": user_message,
             "user_id": user_id,
+            "conversation_id": conversation_id,
+            "messages": conversation_history or [],
+            "is_new_conversation": conversation_history is None or len(conversation_history) == 0,
             "response": None,
             "tool_calls": None,
             "reflection_approved": None,

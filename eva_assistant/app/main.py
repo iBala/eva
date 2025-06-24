@@ -34,6 +34,7 @@ from eva_assistant.auth.user_auth import UserAuthManager
 from eva_assistant.auth.eva_auth import EvaAuthManager
 from eva_assistant.config import settings, get_eva_oauth_config
 from eva_assistant.agent.graph import get_eva_graph
+from eva_assistant.memory.conversation import ConversationManager  # NEW: Add conversation management
 
 # Configure logging
 logging.basicConfig(
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("🚀 Starting Eva Assistant API...")
+    
+    # Initialize ConversationManager - NEW: Add conversation persistence
+    try:
+        conversation_manager = ConversationManager(
+            db_path=settings.conversation_db_path,
+            message_limit=settings.conversation_message_limit
+        )
+        app.state.conversation_manager = conversation_manager
+        logger.info("✅ ConversationManager initialized successfully!")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize ConversationManager: {e}")
+        # Continue without conversation management
     
     # Initialize LangGraph agent
     try:
@@ -84,22 +97,29 @@ def generate_conversation_id() -> str:
     return str(uuid.uuid4())
 
 
-async def eva_response(message: str, user_id: str, conversation_id: str = None) -> str:
+async def eva_response(message: str, user_id: str, conversation_id: str = None, 
+                      conversation_history: list = None) -> str:
     """
-    Get Eva's response using the new LLM agent.
+    Get Eva's response using the new LLM agent with conversation history.
     
     Args:
         message: User message
         user_id: User identifier
         conversation_id: Conversation ID (optional, used for logging)
+        conversation_history: Historical messages for context
         
     Returns:
         Eva's response
     """
     try:
-        # Use the new LLM agent through the graph
+        # Use the new LLM agent through the graph with conversation history
         eva_graph = get_eva_graph()
-        result = await eva_graph.process_message(message, user_id)
+        result = await eva_graph.process_message(
+            message, 
+            user_id, 
+            conversation_id=conversation_id,
+            conversation_history=conversation_history or []
+        )
         
         logger.info(f"Eva processed message successfully: {len(result.get('tool_calls', []))} tool calls")
         return result.get("response", "I apologize, but I'm having trouble processing your request right now.")
@@ -120,7 +140,8 @@ async def eva_response(message: str, user_id: str, conversation_id: str = None) 
             return f"I understand you'd like help with: {message}. As your executive assistant, I can help with meeting scheduling, calendar management, and email coordination. Could you provide more details about what you need?"
 
 
-async def eva_stream(message: str, user_id: str, conversation_id: str) -> AsyncGenerator[StreamChunk, None]:
+async def eva_stream(message: str, user_id: str, conversation_id: str, 
+                    conversation_history: list = None) -> AsyncGenerator[StreamChunk, None]:
     """
     Stream Eva's response using the new LLM agent.
     
@@ -133,10 +154,10 @@ async def eva_stream(message: str, user_id: str, conversation_id: str) -> AsyncG
         StreamChunk: Individual response chunks
     """
     try:
-        # Use the new LLM agent streaming
+        # Use the new LLM agent streaming with conversation history
         eva_graph = get_eva_graph()
         
-        async for chunk in eva_graph.stream_message(message, user_id):
+        async for chunk in eva_graph.stream_message(message, user_id, conversation_id, conversation_history):
             if chunk.get("type") == "content":
                 # Stream content as it comes
                 yield StreamChunk(
@@ -220,26 +241,92 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Chat with Eva - synchronous response.
+    Enhanced Chat with Eva - synchronous response with conversation history.
     
     Args:
-        request: Chat request containing user message and metadata
+        request: Chat request containing user message and optional conversation_id
         
     Returns:
-        ChatResponse: Eva's response
+        ChatResponse: Eva's response with conversation persistence
     """
     try:
-        conversation_id = request.conversation_id or generate_conversation_id()
+        # Get conversation manager
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
+        if not conversation_manager:
+            logger.warning("ConversationManager not available, using basic response")
+            conversation_id = request.conversation_id or generate_conversation_id()
+            response = await eva_response(request.message, request.user_id, conversation_id)
+            return ChatResponse(
+                response=response,
+                conversation_id=conversation_id,
+                metadata={"user_id": request.user_id}
+            )
         
-        logger.info(f"Chat request from {request.user_id}: {request.message}")
+        # Handle conversation ID
+        conversation_id = request.conversation_id
+        is_new_conversation = conversation_id is None
         
-        # Use LangGraph agent for response
-        response = await eva_response(request.message, request.user_id, conversation_id)
+        if is_new_conversation:
+            # Generate new conversation ID
+            conversation_id = conversation_manager.generate_conversation_id()
+            
+            # Create new conversation
+            conversation_manager.create_conversation(
+                conversation_id=conversation_id,
+                user_id=request.user_id,
+                metadata={"created_via": "chat_api"}
+            )
+            logger.info(f"Created new conversation {conversation_id} for user {request.user_id}")
+        else:
+            # Verify conversation exists
+            if not conversation_manager.conversation_exists(conversation_id):
+                logger.warning(f"Conversation {conversation_id} not found, creating new one")
+                conversation_manager.create_conversation(
+                    conversation_id=conversation_id,
+                    user_id=request.user_id,
+                    metadata={"created_via": "chat_api"}
+                )
+        
+        # Get conversation history for context (if not a new conversation)
+        conversation_history = []
+        if not is_new_conversation:
+            conversation_history = conversation_manager.get_conversation_messages_for_llm(conversation_id)
+            logger.info(f"Loaded {len(conversation_history)} historical messages for conversation {conversation_id}")
+        
+        logger.info(f"Chat request from {request.user_id}: {request.message} (conversation: {conversation_id})")
+        
+        # Add user message to conversation
+        conversation_manager.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=request.message,
+            metadata={"timestamp": datetime.utcnow().isoformat()}
+        )
+        
+        # Use LangGraph agent for response with conversation history
+        response = await eva_response(
+            message=request.message, 
+            user_id=request.user_id, 
+            conversation_id=conversation_id,
+            conversation_history=conversation_history
+        )
+        
+        # Add assistant response to conversation
+        conversation_manager.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=response,
+            metadata={"timestamp": datetime.utcnow().isoformat()}
+        )
         
         return ChatResponse(
             response=response,
             conversation_id=conversation_id,
-            metadata={"user_id": request.user_id}
+            metadata={
+                "user_id": request.user_id,
+                "is_new_conversation": is_new_conversation,
+                "historical_messages": len(conversation_history)
+            }
         )
         
     except Exception as e:
@@ -256,24 +343,66 @@ async def chat(request: ChatRequest):
 @app.post("/stream")
 async def stream_chat(request: ChatRequest):
     """
-    Chat with Eva - streaming response.
+    Enhanced Chat with Eva - streaming response with conversation history.
     
     Args:
-        request: Chat request containing user message and metadata
+        request: Chat request containing user message and optional conversation_id
         
     Returns:
-        StreamingResponse: Server-sent events with Eva's response chunks
+        StreamingResponse: Server-sent events with Eva's response chunks and conversation persistence
     """
     try:
-        conversation_id = request.conversation_id or generate_conversation_id()
+        # Get conversation manager
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
         
-        logger.info(f"Stream request from {request.user_id}: {request.message}")
+        # Handle conversation ID
+        conversation_id = request.conversation_id
+        is_new_conversation = conversation_id is None
+        
+        if is_new_conversation:
+            conversation_id = generate_conversation_id()
+            if conversation_manager:
+                conversation_manager.create_conversation(
+                    conversation_id=conversation_id,
+                    user_id=request.user_id,
+                    metadata={"created_via": "stream_api"}
+                )
+        
+        # Get conversation history for context
+        conversation_history = []
+        if conversation_manager and not is_new_conversation:
+            conversation_history = conversation_manager.get_conversation_messages_for_llm(conversation_id)
+        
+        logger.info(f"Stream request from {request.user_id}: {request.message} (conversation: {conversation_id}, history: {len(conversation_history)})")
+        
+        # Add user message to conversation if manager available
+        if conversation_manager:
+            conversation_manager.add_message(
+                conversation_id=conversation_id,
+                role="user",
+                content=request.message,
+                metadata={"timestamp": datetime.utcnow().isoformat()}
+            )
         
         async def generate_stream():
+            assistant_response = ""
             try:
-                # Use LangGraph agent for streaming
-                async for chunk in eva_stream(request.message, request.user_id, conversation_id):
+                # Use LangGraph agent for streaming with conversation history
+                async for chunk in eva_stream(request.message, request.user_id, conversation_id, conversation_history):
+                    # Collect assistant response for persistence
+                    if chunk.type == "text":
+                        assistant_response += chunk.content + " "
+                    
                     yield f"data: {chunk.json()}\n\n"
+                
+                # Add assistant response to conversation if manager available
+                if conversation_manager and assistant_response.strip():
+                    conversation_manager.add_message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=assistant_response.strip(),
+                        metadata={"timestamp": datetime.utcnow().isoformat()}
+                    )
                 
                 # Send end marker
                 yield "data: [DONE]\n\n"
@@ -890,6 +1019,247 @@ async def get_working_hours_examples():
             "timezone": "All times are in the user's local timezone"
         }
     }
+
+
+# Email Management Endpoints
+
+@app.get("/user/{user_id}/emails")
+async def get_user_emails(user_id: str):
+    """Get all email addresses owned by a user."""
+    try:
+        user_auth = UserAuthManager()
+        mapping = user_auth.get_user_email_mapping(user_id)
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "primary_email": mapping.get("primary_email"),
+            "owned_emails": mapping.get("owned_emails", []),
+            "email_count": len(mapping.get("owned_emails", [])),
+            "created_at": mapping.get("created_at"),
+            "updated_at": mapping.get("updated_at")
+        }
+    except Exception as e:
+        logger.error(f"Failed to get emails for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user/{user_id}/emails/{email}/set-primary")
+async def set_primary_email(user_id: str, email: str):
+    """Set an email as the primary email for a user."""
+    try:
+        user_auth = UserAuthManager()
+        success = user_auth.set_primary_email_for_user(user_id, email)
+        
+        if not success:
+            raise HTTPException(status_code=400, detail=f"Cannot set {email} as primary - email not owned by user {user_id}")
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "primary_email": email,
+            "message": f"Primary email set to {email} for user {user_id}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to set primary email {email} for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/email/{email}/user")
+async def find_user_for_email(email: str):
+    """Find which user_id owns a specific email address."""
+    try:
+        user_auth = UserAuthManager()
+        user_id = user_auth.find_user_id_for_email(email)
+        
+        if not user_id:
+            return {
+                "success": False,
+                "email": email,
+                "user_id": None,
+                "connected": False,
+                "message": f"Calendar not connected for email {email}"
+            }
+        
+        # Get additional user info
+        mapping = user_auth.get_user_email_mapping(user_id)
+        is_primary = mapping.get("primary_email") == email
+        
+        return {
+            "success": True,
+            "email": email,
+            "user_id": user_id,
+            "connected": True,
+            "is_primary": is_primary,
+            "user_timezone": user_auth.get_user_timezone(user_id),
+            "total_emails": len(mapping.get("owned_emails", []))
+        }
+    except Exception as e:
+        logger.error(f"Failed to find user for email {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/emails/connected")
+async def list_all_connected_emails():
+    """List all connected email addresses across all users."""
+    try:
+        user_auth = UserAuthManager()
+        connected_users = user_auth.list_connected_users()
+        
+        all_emails = []
+        for user_id in connected_users:
+            mapping = user_auth.get_user_email_mapping(user_id)
+            owned_emails = mapping.get("owned_emails", [])
+            primary_email = mapping.get("primary_email")
+            user_timezone = user_auth.get_user_timezone(user_id)
+            
+            for email in owned_emails:
+                all_emails.append({
+                    "email": email,
+                    "user_id": user_id,
+                    "is_primary": email == primary_email,
+                    "user_timezone": user_timezone,
+                    "connected": user_auth.has_any_connected_calendars(user_id)
+                })
+        
+        return {
+            "success": True,
+            "connected_emails": all_emails,
+            "total_emails": len(all_emails),
+            "total_users": len(connected_users)
+        }
+    except Exception as e:
+        logger.error(f"Failed to list connected emails: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/user/{user_id}/emails/{email}")
+async def remove_email_from_user(user_id: str, email: str):
+    """Remove an email address from a user's owned emails."""
+    try:
+        user_auth = UserAuthManager()
+        
+        # Check if email is owned by this user
+        mapping = user_auth.get_user_email_mapping(user_id)
+        if email not in mapping.get("owned_emails", []):
+            raise HTTPException(status_code=404, detail=f"Email {email} not owned by user {user_id}")
+        
+        success = user_auth.remove_email_from_user(user_id, email)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Failed to remove email {email} from user {user_id}")
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "removed_email": email,
+            "message": f"Email {email} removed from user {user_id}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to remove email {email} from user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# NEW: Conversation Management Endpoints
+
+@app.get("/conversations/stats")
+async def get_conversation_stats():
+    """Get conversation database statistics."""
+    try:
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
+        if not conversation_manager:
+            raise HTTPException(status_code=503, detail="ConversationManager not available")
+        
+        stats = conversation_manager.get_conversation_stats()
+        return {
+            "success": True,
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Failed to get conversation stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+
+@app.get("/user/{user_id}/conversations")
+async def get_user_conversations(user_id: str, limit: int = 20):
+    """Get all conversations for a user."""
+    try:
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
+        if not conversation_manager:
+            raise HTTPException(status_code=503, detail="ConversationManager not available")
+        
+        conversations = conversation_manager.get_user_conversations(user_id, limit)
+        return {
+            "success": True,
+            "user_id": user_id,
+            "conversations": conversations,
+            "count": len(conversations)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get conversations for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get conversations: {str(e)}")
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation_details(conversation_id: str, include_messages: bool = True):
+    """Get conversation details and optionally messages."""
+    try:
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
+        if not conversation_manager:
+            raise HTTPException(status_code=503, detail="ConversationManager not available")
+        
+        # Get conversation info
+        info = conversation_manager.get_conversation_info(conversation_id)
+        if not info:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        result = {
+            "success": True,
+            "conversation": info
+        }
+        
+        # Include messages if requested
+        if include_messages:
+            messages = conversation_manager.get_conversation_history(conversation_id)
+            result["messages"] = messages
+            result["message_count"] = len(messages)
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get conversation: {str(e)}")
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation and all its messages."""
+    try:
+        conversation_manager = getattr(app.state, 'conversation_manager', None)
+        if not conversation_manager:
+            raise HTTPException(status_code=503, detail="ConversationManager not available")
+        
+        success = conversation_manager.delete_conversation(conversation_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Conversation {conversation_id} deleted successfully"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete conversation: {str(e)}")
 
 
 if __name__ == "__main__":

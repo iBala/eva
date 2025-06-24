@@ -10,14 +10,19 @@ from typing_extensions import TypedDict
 
 class EvaState(TypedDict):
     """
-    Simplified Eva Assistant conversation state.
+    Enhanced Eva Assistant conversation state with conversation history support.
     
-    Essential fields for the meeting_agent + reflect workflow.
+    Essential fields for the meeting_agent + reflect workflow plus conversation persistence.
     """
     
     # Core input
     user_message: str
     user_id: str
+    
+    # Conversation context - NEW: Added for conversation history support
+    conversation_id: Optional[str]
+    messages: Optional[list]  # Historical messages in LLM format for context
+    is_new_conversation: Optional[bool]  # Flag to indicate if this is a new conversation
     
     # Meeting agent output
     response: Optional[str]
@@ -36,13 +41,18 @@ class EvaState(TypedDict):
 
 def create_eva_state(
     user_id: str = "founder",
-    conversation_id: str = "",
-    current_request: str = ""
+    conversation_id: Optional[str] = None,
+    user_message: str = "",
+    messages: Optional[list] = None,
+    is_new_conversation: bool = True
 ) -> EvaState:
-    """Create a new simplified EvaState with default values."""
+    """Create a new enhanced EvaState with conversation support."""
     return EvaState(
-        user_message="",
+        user_message=user_message,
         user_id=user_id,
+        conversation_id=conversation_id,
+        messages=messages or [],
+        is_new_conversation=is_new_conversation,
         response=None,
         tool_calls=None,
         reflection_approved=None,

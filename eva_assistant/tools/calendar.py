@@ -159,7 +159,7 @@ def convert_datetime_from_user_timezone(dt_string: str, user_timezone: str) -> s
 
 class GetAllEventsArgs(BaseModel):
     """Arguments for getting all calendar events."""
-    user_id: str = Field(..., description="User ID whose calendar to check")
+    email: str = Field(..., description="Email address whose calendar to check")
     start_time: Optional[str] = Field(
         None, 
         description="Start time in ISO 8601 format (e.g., '2025-01-23T09:00:00Z' or '2025-01-23T09:00:00+05:30'). Defaults to now if not provided."
@@ -169,6 +169,10 @@ class GetAllEventsArgs(BaseModel):
         description="End time in ISO 8601 format (e.g., '2025-01-23T17:00:00Z' or '2025-01-23T17:00:00+05:30'). Defaults to 1 week from now if not provided."
     )
     max_results: int = Field(50, description="Maximum number of events to return")
+    display_timezone: Optional[str] = Field(
+        None, 
+        description="Timezone for displaying results (e.g., 'America/New_York', 'Asia/Kolkata'). If not provided, uses primary user's timezone."
+    )
     
     @validator('start_time', 'end_time', pre=True)
     def normalize_datetime(cls, v):
@@ -180,13 +184,17 @@ class GetAllEventsArgs(BaseModel):
 
 class GetEventArgs(BaseModel):
     """Arguments for getting a specific calendar event."""
-    user_id: str = Field(..., description="User ID whose calendar to check")
+    email: str = Field(..., description="Email address whose calendar to check")
     event_id: str = Field(..., description="Google Calendar event ID")
+    display_timezone: Optional[str] = Field(
+        None, 
+        description="Timezone for displaying results (e.g., 'America/New_York', 'Asia/Kolkata'). If not provided, uses primary user's timezone."
+    )
 
 
 class CreateEventArgs(BaseModel):
     """Arguments for creating a calendar event in Eva's calendar."""
-    user_id: str = Field(..., description="User ID who initiated the meeting (will be set as organizer)")
+    organizer_email: str = Field(..., description="Email address of the user organizing the meeting")
     title: str = Field(..., description="Meeting title")
     start: str = Field(
         ..., 
@@ -199,6 +207,10 @@ class CreateEventArgs(BaseModel):
     attendees: List[str] = Field(default_factory=list, description="List of attendee email addresses")
     description: str = Field(default="", description="Meeting description")
     location: str = Field(default="", description="Meeting location or video link")
+    display_timezone: Optional[str] = Field(
+        None, 
+        description="Timezone for displaying results (e.g., 'America/New_York', 'Asia/Kolkata'). If not provided, uses primary user's timezone."
+    )
     
     @validator('start', 'end', pre=True)
     def normalize_datetime(cls, v):
@@ -212,13 +224,17 @@ class CreateEventArgs(BaseModel):
 
 class CheckAvailabilityArgs(BaseModel):
     """Arguments for checking calendar availability."""
-    user_id: str = Field(..., description="User ID whose calendar to check")
+    email: str = Field(..., description="Email address whose calendar availability to check")
     date: str = Field(
         ..., 
         description="Date to check availability in YYYY-MM-DD format (e.g., '2025-01-23')"
     )
     duration_minutes: int = Field(30, description="Duration of meeting in minutes")
     max_suggestions: int = Field(10, description="Maximum number of free slot suggestions")
+    display_timezone: Optional[str] = Field(
+        None, 
+        description="Timezone for displaying results (e.g., 'America/New_York', 'Asia/Kolkata'). If not provided, uses primary user's timezone."
+    )
     
     @validator('date', pre=True)
     def validate_date(cls, v):
@@ -242,23 +258,49 @@ class GetAllEventsTool(ToolABC):
     returns = lambda events: f"Found {len(events.get('events', []))} events"
     
     async def run(self, args: GetAllEventsArgs) -> Dict[str, Any]:
-        """Get all calendar events for the specified user and time range."""
+        """Execute with default context (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: GetAllEventsArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Get all calendar events for the specified email and time range with timezone context."""
+        # Determine display timezone: explicit > primary user > user's own timezone > UTC
+        display_timezone = (
+            args.display_timezone or 
+            context.get('primary_timezone') or 
+            'UTC'
+        )
+        
         # Log input parameters
         logger.info(f"=== GetAllEventsTool INPUT ===")
-        logger.info(f"user_id: {args.user_id}")
+        logger.info(f"email: {args.email}")
         logger.info(f"start_time: {args.start_time}")
         logger.info(f"end_time: {args.end_time}")
         logger.info(f"max_results: {args.max_results}")
+        logger.info(f"display_timezone: {display_timezone}")
+        logger.info(f"primary_user_context: {context}")
         
         try:
             # Use user auth manager for reading user calendars (read-only access)
             user_auth = UserAuthManager()
             
-            # Get user's timezone preference
-            user_timezone = user_auth.get_user_timezone(args.user_id)
-            logger.info(f"User {args.user_id} timezone: {user_timezone}")
+            # Find user_id that owns this email
+            user_id = user_auth.find_user_id_for_email(args.email)
+            if not user_id:
+                return {
+                    'success': False,
+                    'error': f'Calendar not connected for email {args.email}',
+                    'events': [],
+                    'email': args.email,
+                    'display_timezone': display_timezone
+                }
             
-            service = await user_auth.get_user_calendar_service(args.user_id)
+            # Get user's timezone preference
+            user_timezone = user_auth.get_user_timezone(user_id)
+            logger.info(f"Email {args.email} (user {user_id}) timezone: {user_timezone}")
+            logger.info(f"Display timezone: {display_timezone}")
+            
+            # Get calendar service for this email
+            service = await user_auth.get_calendar_service_for_email(args.email)
             
             # Set default time range if not provided (already normalized by validator)
             if not args.start_time:
@@ -286,46 +328,37 @@ class GetAllEventsTool(ToolABC):
                 end_time_utc = convert_datetime_from_user_timezone(end_time, user_timezone)
                 logger.info(f"Converted end_time: {end_time} -> {end_time_utc}")
             
-            # Get user's selected calendars
-            # Wrap blocking API call in asyncio.to_thread()
-            calendar_list = await asyncio.to_thread(
-                service.calendarList().list().execute
-            )
-            all_calendars = calendar_list.get('items', [])
+            # Get user's self calendars for this email (only calendars they've selected as "self")
+            self_calendar_ids = user_auth.get_user_self_calendars_for_email(args.email)
             
-            # Get user's selected calendar IDs
-            selected_calendar_ids = user_auth.get_user_selected_calendars(args.user_id)
-            
-            # Filter to only selected calendars (fallback to owned calendars if no selection)
-            if selected_calendar_ids:
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('id') in selected_calendar_ids
-                ]
-                logger.info(f"Using {len(user_calendars)} selected calendars for user {args.user_id}")
-            else:
-                # Fallback to owned calendars if no selection exists
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('accessRole') == 'owner'
-                ]
-                logger.warning(f"No calendar selection found for user {args.user_id}, using {len(user_calendars)} owned calendars")
-            
-            if not user_calendars:
-                logger.warning(f"No usable calendars found for user {args.user_id}")
-                return {
-                    'success': False,
-                    'error': 'No calendars available. Please connect and select calendars first.',
-                    'events': [],
-                    'user_timezone': user_timezone
-                }
-            
-            # Collect events from all calendars using UTC times
-            all_events = []
-            for calendar in user_calendars:
-                calendar_id = calendar.get('id')
-                calendar_name = calendar.get('summary', calendar_id)
+            if not self_calendar_ids:
+                # Fallback: get all calendars and filter to owned ones
+                calendar_list = await asyncio.to_thread(
+                    service.calendarList().list().execute
+                )
+                all_calendars = calendar_list.get('items', [])
                 
+                # Use primary calendar as fallback
+                primary_calendar = next((cal for cal in all_calendars if cal.get('primary')), None)
+                if primary_calendar:
+                    self_calendar_ids = [primary_calendar['id']]
+                    logger.info(f"Using primary calendar as fallback for email {args.email}")
+                else:
+                    logger.warning(f"No calendars found for email {args.email}")
+                    return {
+                        'success': False,
+                        'error': f'No calendars available for email {args.email}',
+                        'events': [],
+                        'email': args.email,
+                        'user_timezone': user_timezone,
+                        'display_timezone': display_timezone
+                    }
+            
+            logger.info(f"Using {len(self_calendar_ids)} self calendars for email {args.email}")
+            
+            # Collect events from self calendars only
+            all_events = []
+            for calendar_id in self_calendar_ids:
                 try:
                     # Wrap blocking API call in asyncio.to_thread()
                     events_result = await asyncio.to_thread(
@@ -343,63 +376,66 @@ class GetAllEventsTool(ToolABC):
                     
                     # Add calendar info to each event
                     for event in calendar_events:
-                        event['source_calendar'] = calendar_name
+                        event['source_calendar'] = calendar_id
                         all_events.append(event)
                         
                 except Exception as e:
-                    logger.warning(f"Failed to get events from calendar '{calendar_name}' for user {args.user_id}: {e}")
+                    logger.warning(f"Failed to get events from calendar '{calendar_id}' for email {args.email}: {e}")
                     continue
             
             # Sort events by start time and limit results
             all_events.sort(key=lambda x: x.get('start', {}).get('dateTime', x.get('start', {}).get('date', '')))
             events = all_events[:args.max_results]
             
-            # Format events for easier consumption with timezone conversion
+            # Format events for easier consumption with timezone conversion to display timezone
             formatted_events = []
             for event in events:
                 # Get event times
                 event_start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date'))
                 event_end = event.get('end', {}).get('dateTime', event.get('end', {}).get('date'))
                 
-                # Convert to user timezone
-                event_start_user_tz = None
-                event_end_user_tz = None
+                # Convert to display timezone
+                event_start_display_tz = None
+                event_end_display_tz = None
                 
                 if event_start:
-                    event_start_user_tz = convert_datetime_to_user_timezone(event_start, user_timezone)
+                    event_start_display_tz = convert_datetime_to_user_timezone(event_start, display_timezone)
                 if event_end:
-                    event_end_user_tz = convert_datetime_to_user_timezone(event_end, user_timezone)
+                    event_end_display_tz = convert_datetime_to_user_timezone(event_end, display_timezone)
                 
                 formatted_event = {
                     'id': event.get('id'),
                     'title': event.get('summary', 'No Title'),
-                    'start': event_start_user_tz,
-                    'end': event_end_user_tz,
+                    'start': event_start_display_tz,
+                    'end': event_end_display_tz,
                     'start_utc': event_start,  # Keep UTC for reference
                     'end_utc': event_end,      # Keep UTC for reference
                     'attendees': [attendee.get('email') for attendee in event.get('attendees', [])],
                     'location': event.get('location', ''),
                     'description': event.get('description', ''),
                     'calendar': event.get('source_calendar', 'Unknown'),
-                    'timezone': user_timezone
+                    'timezone': display_timezone
                 }
                 formatted_events.append(formatted_event)
             
-            logger.info(f"Retrieved {len(formatted_events)} events across {len(user_calendars)} calendars for user {args.user_id}")
+            logger.info(f"Retrieved {len(formatted_events)} events across {len(self_calendar_ids)} calendars for email {args.email}")
             
             result = {
                 'success': True,
                 'events': formatted_events,
                 'count': len(formatted_events),
-                'calendars_checked': len(user_calendars),
+                'calendars_checked': len(self_calendar_ids),
+                'email': args.email,
                 'user_timezone': user_timezone,
+                'display_timezone': display_timezone,
                 'time_range': {
-                    'start': convert_datetime_to_user_timezone(start_time_utc, user_timezone),
-                    'end': convert_datetime_to_user_timezone(end_time_utc, user_timezone),
+                    'start': convert_datetime_to_user_timezone(start_time_utc, display_timezone),
+                    'end': convert_datetime_to_user_timezone(end_time_utc, display_timezone),
                     'start_utc': start_time_utc,
                     'end_utc': end_time_utc,
-                    'timezone': user_timezone
-                }
+                    'timezone': display_timezone
+                },
+                'message': f"Retrieved {len(formatted_events)} events (times shown in {display_timezone})"
             }
             
             # Log output
@@ -407,19 +443,23 @@ class GetAllEventsTool(ToolABC):
             logger.info(f"success: {result['success']}")
             logger.info(f"count: {result['count']}")
             logger.info(f"calendars_checked: {result['calendars_checked']}")
+            logger.info(f"email: {result['email']}")
             logger.info(f"user_timezone: {result['user_timezone']}")
+            logger.info(f"display_timezone: {result['display_timezone']}")
             logger.info(f"time_range: {result['time_range']}")
             logger.info(f"events sample: {[e.get('title', 'No title') for e in formatted_events[:3]]}")
             
             return result
             
         except Exception as e:
-            logger.error(f"Failed to get calendar events for user {args.user_id}: {e}")
+            logger.error(f"Failed to get calendar events for email {args.email}: {e}")
             return {
                 'success': False,
                 'error': str(e),
                 'events': [],
-                'user_timezone': user_auth.get_user_timezone(args.user_id) if 'user_auth' in locals() else 'UTC'
+                'email': args.email,
+                'user_timezone': 'UTC',
+                'display_timezone': display_timezone
             }
 
 
@@ -432,53 +472,68 @@ class GetEventTool(ToolABC):
     returns = lambda event: f"Event: {event.get('title', 'Unknown')}"
     
     async def run(self, args: GetEventArgs) -> Dict[str, Any]:
-        """Get specific calendar event details across all user calendars."""
+        """Execute with default context (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: GetEventArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Get specific calendar event details for the specified email with timezone context."""
+        # Determine display timezone: explicit > primary user > user's own timezone > UTC
+        display_timezone = (
+            args.display_timezone or 
+            context.get('primary_timezone') or 
+            'UTC'
+        )
+        
         try:
             # Use user auth manager for reading user calendars (read-only access)
             user_auth = UserAuthManager()
-            service = await user_auth.get_user_calendar_service(args.user_id)
             
-            # Get user's selected calendars
-            # Wrap blocking API call in asyncio.to_thread()
-            calendar_list = await asyncio.to_thread(
-                service.calendarList().list().execute
-            )
-            all_calendars = calendar_list.get('items', [])
-            
-            # Get user's selected calendar IDs
-            selected_calendar_ids = user_auth.get_user_selected_calendars(args.user_id)
-            
-            # Filter to only selected calendars (fallback to owned calendars if no selection)
-            if selected_calendar_ids:
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('id') in selected_calendar_ids
-                ]
-                logger.info(f"Using {len(user_calendars)} selected calendars for user {args.user_id}")
-            else:
-                # Fallback to owned calendars if no selection exists
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('accessRole') == 'owner'
-                ]
-                logger.warning(f"No calendar selection found for user {args.user_id}, using {len(user_calendars)} owned calendars")
-            
-            if not user_calendars:
-                logger.warning(f"No usable calendars found for user {args.user_id}")
+            # Find user_id that owns this email
+            user_id = user_auth.find_user_id_for_email(args.email)
+            if not user_id:
                 return {
                     'success': False,
-                    'error': 'No calendars available. Please connect and select calendars first.',
-                    'event': None
+                    'error': f'Calendar not connected for email {args.email}',
+                    'event': None,
+                    'email': args.email,
+                    'display_timezone': display_timezone
                 }
             
-            # Search for the event across all calendars
+            # Get user's timezone preference
+            user_timezone = user_auth.get_user_timezone(user_id)
+            logger.info(f"Email {args.email} (user {user_id}) timezone: {user_timezone}")
+            logger.info(f"Display timezone: {display_timezone}")
+            
+            # Get calendar service for this email
+            service = await user_auth.get_calendar_service_for_email(args.email)
+            
+            # Get user's self calendars for this email
+            self_calendar_ids = user_auth.get_user_self_calendars_for_email(args.email)
+            
+            if not self_calendar_ids:
+                # Fallback: get all calendars and use primary
+                calendar_list = await asyncio.to_thread(
+                    service.calendarList().list().execute
+                )
+                all_calendars = calendar_list.get('items', [])
+                
+                primary_calendar = next((cal for cal in all_calendars if cal.get('primary')), None)
+                if primary_calendar:
+                    self_calendar_ids = [primary_calendar['id']]
+                else:
+                    return {
+                        'success': False,
+                        'error': f'No calendars available for email {args.email}',
+                        'event': None,
+                        'email': args.email,
+                        'display_timezone': display_timezone
+                    }
+            
+            # Search for the event across self calendars
             event = None
             source_calendar = None
             
-            for calendar in user_calendars:
-                calendar_id = calendar.get('id')
-                calendar_name = calendar.get('summary', calendar_id)
-                
+            for calendar_id in self_calendar_ids:
                 try:
                     # Try to get the event from this calendar
                     # Wrap blocking API call in asyncio.to_thread()
@@ -489,28 +544,44 @@ class GetEventTool(ToolABC):
                         ).execute
                     )
                     
-                    source_calendar = calendar_name
+                    source_calendar = calendar_id
                     break  # Found the event, stop searching
                     
                 except Exception as e:
                     # Event not found in this calendar, try next one
-                    logger.debug(f"Event {args.event_id} not found in calendar '{calendar_name}' for user {args.user_id}: {e}")
+                    logger.debug(f"Event {args.event_id} not found in calendar '{calendar_id}' for email {args.email}: {e}")
                     continue
             
             if not event:
-                logger.warning(f"Event {args.event_id} not found in any calendar for user {args.user_id}")
+                logger.warning(f"Event {args.event_id} not found in any calendar for email {args.email}")
                 return {
                     'success': False,
                     'error': f"Event {args.event_id} not found",
-                    'event': None
+                    'event': None,
+                    'email': args.email,
+                    'display_timezone': display_timezone
                 }
+            
+            # Get event times and convert to display timezone
+            event_start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date'))
+            event_end = event.get('end', {}).get('dateTime', event.get('end', {}).get('date'))
+            
+            event_start_display_tz = None
+            event_end_display_tz = None
+            
+            if event_start:
+                event_start_display_tz = convert_datetime_to_user_timezone(event_start, display_timezone)
+            if event_end:
+                event_end_display_tz = convert_datetime_to_user_timezone(event_end, display_timezone)
             
             # Format event for easier consumption
             formatted_event = {
                 'id': event.get('id'),
                 'title': event.get('summary', 'No Title'),
-                'start': event.get('start', {}).get('dateTime', event.get('start', {}).get('date')),
-                'end': event.get('end', {}).get('dateTime', event.get('end', {}).get('date')),
+                'start': event_start_display_tz,
+                'end': event_end_display_tz,
+                'start_utc': event_start,  # Keep UTC for reference
+                'end_utc': event_end,      # Keep UTC for reference
                 'attendees': [attendee.get('email') for attendee in event.get('attendees', [])],
                 'location': event.get('location', ''),
                 'description': event.get('description', ''),
@@ -520,22 +591,29 @@ class GetEventTool(ToolABC):
                 'creator': event.get('creator', {}).get('email'),
                 'organizer': event.get('organizer', {}).get('email'),
                 'calendar': source_calendar,
-                'htmlLink': event.get('htmlLink')
+                'htmlLink': event.get('htmlLink'),
+                'timezone': display_timezone
             }
             
-            logger.info(f"Retrieved event {args.event_id} from calendar '{source_calendar}' for user {args.user_id}")
+            logger.info(f"Retrieved event {args.event_id} from calendar '{source_calendar}' for email {args.email}")
             
             return {
                 'success': True,
-                'event': formatted_event
+                'event': formatted_event,
+                'email': args.email,
+                'user_timezone': user_timezone,
+                'display_timezone': display_timezone,
+                'message': f"Event details retrieved (times shown in {display_timezone})"
             }
             
         except Exception as e:
-            logger.error(f"Failed to get event {args.event_id} for user {args.user_id}: {e}")
+            logger.error(f"Failed to get event {args.event_id} for email {args.email}: {e}")
             return {
                 'success': False,
                 'error': str(e),
-                'event': None
+                'event': None,
+                'email': args.email,
+                'display_timezone': display_timezone
             }
 
 
@@ -548,22 +626,47 @@ class CreateEventTool(ToolABC):
     returns = lambda result: f"Event created: {result.get('event', {}).get('htmlLink', 'No link')}"
     
     async def run(self, args: CreateEventArgs) -> Dict[str, Any]:
-        """Create a calendar event in Eva's calendar with user as organizer."""
+        """Execute with default context (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: CreateEventArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a calendar event in Eva's calendar with user as organizer with timezone context."""
+        # Determine display timezone: explicit > primary user > organizer's timezone > UTC
+        display_timezone = (
+            args.display_timezone or 
+            context.get('primary_timezone') or 
+            'UTC'
+        )
+        
         # Log input parameters
         logger.info(f"=== CreateEventTool INPUT ===")
-        logger.info(f"user_id: {args.user_id}")
+        logger.info(f"organizer_email: {args.organizer_email}")
         logger.info(f"title: {args.title}")
         logger.info(f"start: {args.start}")
         logger.info(f"end: {args.end}")
         logger.info(f"attendees: {args.attendees}")
         logger.info(f"description: {args.description[:100]}..." if len(args.description) > 100 else f"description: {args.description}")
         logger.info(f"location: {args.location}")
+        logger.info(f"display_timezone: {display_timezone}")
+        logger.info(f"primary_user_context: {context}")
         
         try:
-            # Get user's timezone preference
+            # Verify organizer email is connected
             user_auth = UserAuthManager()
-            user_timezone = user_auth.get_user_timezone(args.user_id)
-            logger.info(f"User {args.user_id} timezone: {user_timezone}")
+            user_id = user_auth.find_user_id_for_email(args.organizer_email)
+            if not user_id:
+                return {
+                    'success': False,
+                    'error': f'Calendar not connected for organizer email {args.organizer_email}',
+                    'event': None,
+                    'organizer_email': args.organizer_email,
+                    'display_timezone': display_timezone
+                }
+            
+            # Get user's timezone preference
+            user_timezone = user_auth.get_user_timezone(user_id)
+            logger.info(f"Organizer {args.organizer_email} (user {user_id}) timezone: {user_timezone}")
+            logger.info(f"Display timezone: {display_timezone}")
             
             # Convert event times from user timezone to UTC if needed
             start_time_utc = args.start
@@ -584,8 +687,8 @@ class CreateEventTool(ToolABC):
             eva_auth = EvaAuthManager()
             eva_service = await eva_auth.get_calendar_service()
             
-            # Get user's email to set as organizer
-            user_email = await self._get_user_email(user_auth, args.user_id)
+            # Use organizer email directly
+            user_email = args.organizer_email
             
             # Prepare event data using UTC times
             event_body = {
@@ -603,14 +706,14 @@ class CreateEventTool(ToolABC):
                 'attendees': [{'email': email} for email in args.attendees],
                 'organizer': {
                     'email': user_email,
-                    'displayName': args.user_id
+                    'displayName': args.organizer_email
                 },
                 'reminders': {
                     'useDefault': True
                 },
                 'conferenceData': {
                     'createRequest': {
-                        'requestId': f"meet_{args.user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        'requestId': f"meet_{args.organizer_email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                         'conferenceSolutionKey': {'type': 'hangoutsMeet'}
                     }
                 }
@@ -627,16 +730,16 @@ class CreateEventTool(ToolABC):
                 ).execute
             )
             
-            # Convert event times back to user timezone for response
-            created_start_user_tz = convert_datetime_to_user_timezone(event.get('start', {}).get('dateTime', start_time_utc), user_timezone)
-            created_end_user_tz = convert_datetime_to_user_timezone(event.get('end', {}).get('dateTime', end_time_utc), user_timezone)
+            # Convert event times to display timezone for response
+            created_start_display_tz = convert_datetime_to_user_timezone(event.get('start', {}).get('dateTime', start_time_utc), display_timezone)
+            created_end_display_tz = convert_datetime_to_user_timezone(event.get('end', {}).get('dateTime', end_time_utc), display_timezone)
             
             # Format response with timezone information
             created_event = {
                 'id': event.get('id'),
                 'title': event.get('summary'),
-                'start': created_start_user_tz,
-                'end': created_end_user_tz,
+                'start': created_start_display_tz,
+                'end': created_end_display_tz,
                 'start_utc': event.get('start', {}).get('dateTime', start_time_utc),
                 'end_utc': event.get('end', {}).get('dateTime', end_time_utc),
                 'attendees': args.attendees,
@@ -644,16 +747,18 @@ class CreateEventTool(ToolABC):
                 'htmlLink': event.get('htmlLink'),
                 'hangoutLink': event.get('hangoutLink'),
                 'status': event.get('status'),
-                'timezone': user_timezone
+                'timezone': display_timezone
             }
             
-            logger.info(f"Created event {event.get('id')} for user {args.user_id}")
+            logger.info(f"Created event {event.get('id')} for organizer {args.organizer_email}")
             
             result = {
                 'success': True,
                 'event': created_event,
+                'organizer_email': args.organizer_email,
                 'user_timezone': user_timezone,
-                'message': f"Event '{args.title}' created successfully in {user_timezone} timezone"
+                'display_timezone': display_timezone,
+                'message': f"Event '{args.title}' created successfully (times shown in {display_timezone})"
             }
             
             # Log output
@@ -661,49 +766,28 @@ class CreateEventTool(ToolABC):
             logger.info(f"success: {result['success']}")
             logger.info(f"event_id: {created_event.get('id')}")
             logger.info(f"event_title: {created_event.get('title')}")
-            logger.info(f"event_start (user_tz): {created_event.get('start')}")
-            logger.info(f"event_end (user_tz): {created_event.get('end')}")
+            logger.info(f"event_start (display_tz): {created_event.get('start')}")
+            logger.info(f"event_end (display_tz): {created_event.get('end')}")
             logger.info(f"event_start_utc: {created_event.get('start_utc')}")
             logger.info(f"event_end_utc: {created_event.get('end_utc')}")
+            logger.info(f"organizer_email: {result['organizer_email']}")
             logger.info(f"user_timezone: {result['user_timezone']}")
+            logger.info(f"display_timezone: {result['display_timezone']}")
             logger.info(f"html_link: {created_event.get('htmlLink')}")
             logger.info(f"hangout_link: {created_event.get('hangoutLink')}")
             
             return result
             
         except Exception as e:
-            logger.error(f"Failed to create event for user {args.user_id}: {e}")
+            logger.error(f"Failed to create event for organizer {args.organizer_email}: {e}")
             return {
                 'success': False,
                 'error': str(e),
                 'event': None,
-                'user_timezone': user_auth.get_user_timezone(args.user_id) if 'user_auth' in locals() else 'UTC'
+                'organizer_email': args.organizer_email,
+                'user_timezone': 'UTC',
+                'display_timezone': display_timezone
             }
-    
-    async def _get_user_email(self, user_auth: UserAuthManager, user_id: str) -> str:
-        """Get user's email address from their calendar connection."""
-        try:
-            service = await user_auth.get_user_calendar_service(user_id)
-            
-            # Get user's calendar list to find primary calendar (which has their email)
-            # Wrap blocking API call in asyncio.to_thread()
-            calendar_list = await asyncio.to_thread(
-                service.calendarList().list().execute
-            )
-            calendars = calendar_list.get('items', [])
-            
-            # Find primary calendar to get user's email
-            primary_calendar = next((cal for cal in calendars if cal.get('primary')), None)
-            if primary_calendar:
-                return primary_calendar.get('id', user_id)  # Calendar ID is the email for primary
-            
-            # Fallback to user_id if we can't get email
-            logger.warning(f"Could not determine email for user {user_id}, using user_id")
-            return user_id
-            
-        except Exception as e:
-            logger.error(f"Failed to get email for user {user_id}: {e}")
-            return user_id  # Fallback to user_id
 
 
 # Update and Delete event tools removed to maintain read-only access to user calendars
@@ -719,24 +803,50 @@ class CheckAvailabilityTool(ToolABC):
     returns = lambda result: f"Found {len(result.get('free_slots', []))} free slots"
     
     async def run(self, args: CheckAvailabilityArgs) -> Dict[str, Any]:
-        """Check availability using user's working hours configuration."""
+        """Execute with default context (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: CheckAvailabilityArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Check availability using user's working hours configuration with timezone context."""
+        # Determine display timezone: explicit > primary user > user's own timezone > UTC
+        display_timezone = (
+            args.display_timezone or 
+            context.get('primary_timezone') or 
+            'UTC'
+        )
+        
         # Log input parameters
         logger.info(f"=== CheckAvailabilityTool INPUT ===")
-        logger.info(f"user_id: {args.user_id}")
+        logger.info(f"email: {args.email}")
         logger.info(f"date: {args.date}")
         logger.info(f"duration_minutes: {args.duration_minutes}")
         logger.info(f"max_suggestions: {args.max_suggestions}")
+        logger.info(f"display_timezone: {display_timezone}")
+        logger.info(f"primary_user_context: {context}")
         
         try:
             # Use user auth manager for reading user calendars (read-only access)
-            logger.info(f"Initializing UserAuthManager for user {args.user_id}")
+            logger.info(f"Initializing UserAuthManager for email {args.email}")
             user_auth = UserAuthManager()
             
+            # Find user_id that owns this email
+            user_id = user_auth.find_user_id_for_email(args.email)
+            if not user_id:
+                return {
+                    'success': False,
+                    'error': f'Calendar not connected for email {args.email}',
+                    'free_slots': [],
+                    'email': args.email,
+                    'date': args.date,
+                    'display_timezone': display_timezone
+                }
+            
             # Get user's availability for the specified date
-            availability = user_auth.get_user_availability_for_date(args.user_id, args.date)
+            availability = user_auth.get_user_availability_for_date(user_id, args.date)
             user_timezone = availability.get('timezone', 'UTC')
             
-            logger.info(f"User {args.user_id} timezone: {user_timezone}")
+            logger.info(f"Email {args.email} (user {user_id}) timezone: {user_timezone}")
+            logger.info(f"Display timezone: {display_timezone}")
             logger.info(f"Date {args.date} availability: {availability}")
             
             # Check if user is available on this date
@@ -747,7 +857,9 @@ class CheckAvailabilityTool(ToolABC):
                     'busy_times': [],
                     'calendars_checked': 0,
                     'requested_duration': args.duration_minutes,
+                    'email': args.email,
                     'user_timezone': user_timezone,
+                    'display_timezone': display_timezone,
                     'date': args.date,
                     'working_day': False,
                     'reason': availability.get('reason', 'Not available'),
@@ -774,58 +886,48 @@ class CheckAvailabilityTool(ToolABC):
             logger.info(f"UTC times for API: {start_time_utc} - {end_time_utc}")
             
             # Get calendar service and fetch events
-            logger.info(f"Getting calendar service for user {args.user_id}")
-            service = await user_auth.get_user_calendar_service(args.user_id)
-            logger.info(f"Successfully obtained calendar service for user {args.user_id}")
+            logger.info(f"Getting calendar service for email {args.email}")
+            service = await user_auth.get_calendar_service_for_email(args.email)
+            logger.info(f"Successfully obtained calendar service for email {args.email}")
             
-            # Get user's selected calendars
-            logger.info(f"Getting calendar list for user {args.user_id}")
-            calendar_list = await asyncio.to_thread(
-                service.calendarList().list().execute
-            )
-            all_calendars = calendar_list.get('items', [])
-            logger.info(f"Retrieved {len(all_calendars)} total calendars for user {args.user_id}")
+            # Get user's self calendars for this email
+            self_calendar_ids = user_auth.get_user_self_calendars_for_email(args.email)
             
-            # Get user's selected calendar IDs
-            selected_calendar_ids = user_auth.get_user_selected_calendars(args.user_id)
-            logger.info(f"User {args.user_id} has {len(selected_calendar_ids)} selected calendars: {list(selected_calendar_ids)}")
+            if not self_calendar_ids:
+                # Fallback: get all calendars and use primary
+                logger.info(f"Getting calendar list for email {args.email}")
+                calendar_list = await asyncio.to_thread(
+                    service.calendarList().list().execute
+                )
+                all_calendars = calendar_list.get('items', [])
+                logger.info(f"Retrieved {len(all_calendars)} total calendars for email {args.email}")
+                
+                primary_calendar = next((cal for cal in all_calendars if cal.get('primary')), None)
+                if primary_calendar:
+                    self_calendar_ids = [primary_calendar['id']]
+                    logger.info(f"Using primary calendar as fallback for email {args.email}")
+                else:
+                    logger.error(f"No calendars found for email {args.email}")
+                    return {
+                        'success': False,
+                        'error': f'No calendars available for email {args.email}',
+                        'free_slots': [],
+                        'email': args.email,
+                        'user_timezone': user_timezone,
+                        'display_timezone': display_timezone,
+                        'date': args.date
+                    }
             
-            # Filter to only selected calendars (fallback to owned calendars if no selection)
-            if selected_calendar_ids:
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('id') in selected_calendar_ids
-                ]
-                logger.info(f"Using {len(user_calendars)} selected calendars for user {args.user_id}")
-            else:
-                # Fallback to owned calendars if no selection exists
-                user_calendars = [
-                    cal for cal in all_calendars
-                    if cal.get('accessRole') == 'owner'
-                ]
-                logger.warning(f"No calendar selection found for user {args.user_id}, using {len(user_calendars)} owned calendars")
+            logger.info(f"Email {args.email} has {len(self_calendar_ids)} self calendars: {list(self_calendar_ids)}")
+            logger.info(f"Checking availability across {len(self_calendar_ids)} calendars for email {args.email}")
             
-            if not user_calendars:
-                logger.error(f"No usable calendars found for user {args.user_id}")
-                return {
-                    'success': False,
-                    'error': 'No calendars available. Please connect and select calendars first.',
-                    'free_slots': [],
-                    'user_timezone': user_timezone,
-                    'date': args.date
-                }
-            
-            logger.info(f"Checking availability across {len(user_calendars)} calendars for user {args.user_id}")
-            
-            # Collect busy times from all calendars during working hours
+            # Collect busy times from self calendars only during working hours
             all_busy_times = []
             
-            for calendar in user_calendars:
-                calendar_id = calendar.get('id')
-                calendar_name = calendar.get('summary', calendar_id)
+            for calendar_id in self_calendar_ids:
                 
                 try:
-                    logger.debug(f"Fetching events from calendar '{calendar_name}' for user {args.user_id}")
+                    logger.debug(f"Fetching events from calendar '{calendar_id}' for email {args.email}")
                     events_result = await asyncio.to_thread(
                         service.events().list(
                             calendarId=calendar_id,
@@ -838,97 +940,109 @@ class CheckAvailabilityTool(ToolABC):
                     
                     events = events_result.get('items', [])
                     
-                    # Extract busy times and keep them in user timezone
+                    # Extract busy times and convert to display timezone
                     for event in events:
                         event_start = event.get('start', {}).get('dateTime')
                         event_end = event.get('end', {}).get('dateTime')
                         if event_start and event_end:
-                            # Convert event times to user timezone
-                            start_user_tz = convert_datetime_to_user_timezone(event_start, user_timezone)
-                            end_user_tz = convert_datetime_to_user_timezone(event_end, user_timezone)
+                            # Convert event times to display timezone
+                            start_display_tz = convert_datetime_to_user_timezone(event_start, display_timezone)
+                            end_display_tz = convert_datetime_to_user_timezone(event_end, display_timezone)
                             
                             all_busy_times.append({
-                                'start': start_user_tz,
-                                'end': end_user_tz,
+                                'start': start_display_tz,
+                                'end': end_display_tz,
                                 'start_utc': event_start,
                                 'end_utc': event_end,
                                 'title': event.get('summary', 'Busy'),
-                                'calendar': calendar_name
+                                'calendar': calendar_id,
+                                'timezone': display_timezone
                             })
                             
-                    logger.debug(f"Found {len(events)} events in calendar '{calendar_name}' for user {args.user_id}")
+                    logger.debug(f"Found {len(events)} events in calendar '{calendar_id}' for email {args.email}")
                     
                 except Exception as e:
-                    logger.warning(f"Failed to check calendar '{calendar_name}' for user {args.user_id}: {e}")
+                    logger.warning(f"Failed to check calendar '{calendar_id}' for email {args.email}: {e}")
                     continue
             
-            # Sort all busy times by start time (in user timezone)
+            # Sort all busy times by start time (in display timezone)
             busy_times = sorted(all_busy_times, key=lambda x: x['start'])
-            logger.info(f"Found {len(busy_times)} total busy periods during working hours for user {args.user_id}")
+            logger.info(f"Found {len(busy_times)} total busy periods during working hours for email {args.email}")
             
-            # Find free slots using working hours (already in user timezone)
-            logger.info(f"Finding free slots for user {args.user_id} with {args.duration_minutes}min duration in {user_timezone}")
-            free_slots_user_tz = self._find_free_slots(
-                start_time,  # Working hours start in user timezone
-                end_time,    # Working hours end in user timezone
+            # Convert working hours to display timezone for free slot calculation
+            start_time_display = convert_datetime_to_user_timezone(start_time, display_timezone)
+            end_time_display = convert_datetime_to_user_timezone(end_time, display_timezone)
+            
+            # Find free slots using working hours in display timezone
+            logger.info(f"Finding free slots for email {args.email} with {args.duration_minutes}min duration in {display_timezone}")
+            free_slots_display_tz = self._find_free_slots(
+                start_time_display,  # Working hours start in display timezone
+                end_time_display,    # Working hours end in display timezone
                 args.duration_minutes,
-                busy_times,  # Busy times already in user timezone
+                busy_times,  # Busy times already in display timezone
                 args.max_suggestions
             )
             
             # Convert free slots to include UTC times for reference
             enhanced_free_slots = []
-            for slot in free_slots_user_tz:
+            for slot in free_slots_display_tz:
                 # Convert back to UTC for reference
-                slot_start_utc = convert_datetime_from_user_timezone(slot['start'], user_timezone)
-                slot_end_utc = convert_datetime_from_user_timezone(slot['end'], user_timezone)
+                slot_start_utc = convert_datetime_from_user_timezone(slot['start'], display_timezone)
+                slot_end_utc = convert_datetime_from_user_timezone(slot['end'], display_timezone)
                 
                 enhanced_free_slots.append({
-                    'start': slot['start'],          # Already in user timezone
-                    'end': slot['end'],              # Already in user timezone
+                    'start': slot['start'],          # Already in display timezone
+                    'end': slot['end'],              # Already in display timezone
                     'start_utc': slot_start_utc,     # UTC for reference
                     'end_utc': slot_end_utc,         # UTC for reference
                     'duration_minutes': slot['duration_minutes'],
-                    'timezone': user_timezone
+                    'timezone': display_timezone
                 })
             
-            # Busy times are already in user timezone, just add timezone field
+            # Busy times are already in display timezone, just ensure timezone field is set
             enhanced_busy_times = []
             for busy in busy_times:
                 enhanced_busy_times.append({
-                    'start': busy['start'],          # Already in user timezone
-                    'end': busy['end'],              # Already in user timezone
+                    'start': busy['start'],          # Already in display timezone
+                    'end': busy['end'],              # Already in display timezone
                     'start_utc': busy['start_utc'],  # UTC for reference
                     'end_utc': busy['end_utc'],      # UTC for reference
                     'title': busy['title'],
                     'calendar': busy['calendar'],
-                    'timezone': user_timezone
+                    'timezone': display_timezone
                 })
             
-            logger.info(f"Found {len(enhanced_free_slots)} free slots across {len(user_calendars)} calendars for user {args.user_id}")
+            logger.info(f"Found {len(enhanced_free_slots)} free slots across {len(self_calendar_ids)} calendars for email {args.email}")
+            
+            # Convert working hours to display timezone for response
+            working_start_display = convert_datetime_to_user_timezone(availability['start_time'], display_timezone)
+            working_end_display = convert_datetime_to_user_timezone(availability['end_time'], display_timezone)
             
             result = {
                 'success': True,
                 'free_slots': enhanced_free_slots,
                 'busy_times': enhanced_busy_times,
-                'calendars_checked': len(user_calendars),
+                'calendars_checked': len(self_calendar_ids),
                 'requested_duration': args.duration_minutes,
+                'email': args.email,
                 'user_timezone': user_timezone,
+                'display_timezone': display_timezone,
                 'date': args.date,
                 'working_day': True,
                 'working_hours': {
                     'start': availability['start_time_local'],  # e.g., "09:00"
                     'end': availability['end_time_local'],      # e.g., "17:00"
-                    'start_full': start_time,                   # Full datetime
-                    'end_full': end_time,                       # Full datetime
-                    'timezone': user_timezone
+                    'start_full': working_start_display,        # Full datetime in display timezone
+                    'end_full': working_end_display,            # Full datetime in display timezone
+                    'timezone': display_timezone
                 },
-                'message': f"Found {len(enhanced_free_slots)} available slots on {args.date}"
+                'message': f"Found {len(enhanced_free_slots)} available slots on {args.date} (times shown in {display_timezone})"
             }
             
             # Log output
             logger.info(f"=== CheckAvailabilityTool OUTPUT ===")
             logger.info(f"success: {result['success']}")
+            logger.info(f"email: {result['email']}")
             logger.info(f"date: {result['date']}")
             logger.info(f"working_day: {result['working_day']}")
             logger.info(f"working_hours: {result['working_hours']['start']} - {result['working_hours']['end']}")
@@ -937,8 +1051,9 @@ class CheckAvailabilityTool(ToolABC):
             logger.info(f"calendars_checked: {result['calendars_checked']}")
             logger.info(f"requested_duration: {result['requested_duration']}")
             logger.info(f"user_timezone: {result['user_timezone']}")
+            logger.info(f"display_timezone: {result['display_timezone']}")
             if enhanced_free_slots:
-                logger.info(f"first_free_slot (user_tz): {enhanced_free_slots[0]['start']} - {enhanced_free_slots[0]['end']}")
+                logger.info(f"first_free_slot (display_tz): {enhanced_free_slots[0]['start']} - {enhanced_free_slots[0]['end']}")
                 logger.info(f"first_free_slot (utc): {enhanced_free_slots[0]['start_utc']} - {enhanced_free_slots[0]['end_utc']}")
             if enhanced_busy_times:
                 logger.info(f"busy_times_sample: {[bt.get('title', 'No title') for bt in enhanced_busy_times[:3]]}")
@@ -946,7 +1061,7 @@ class CheckAvailabilityTool(ToolABC):
             return result
             
         except Exception as e:
-            logger.error(f"Failed to check availability for user {args.user_id} on {args.date}: {e}")
+            logger.error(f"Failed to check availability for email {args.email} on {args.date}: {e}")
             logger.error(f"Exception type: {type(e).__name__}")
             logger.error(f"Exception details: {str(e)}")
             import traceback
@@ -955,7 +1070,9 @@ class CheckAvailabilityTool(ToolABC):
                 'success': False,
                 'error': str(e),
                 'free_slots': [],
-                'user_timezone': user_auth.get_user_timezone(args.user_id) if 'user_auth' in locals() else 'UTC',
+                'email': args.email,
+                'user_timezone': 'UTC',
+                'display_timezone': display_timezone,
                 'date': args.date
             }
     
