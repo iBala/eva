@@ -149,6 +149,10 @@ class TimezoneResponse(BaseModel):
 class UserProfileResponse(BaseModel):
     """Schema for user profile responses."""
     user_id: str = Field(..., description="User identifier")
+    first_name: Optional[str] = Field(None, description="User's first name")
+    last_name: Optional[str] = Field(None, description="User's last name")
+    display_name: Optional[str] = Field(None, description="User's display name")
+    email: Optional[str] = Field(None, description="User's email address")
     timezone: str = Field(..., description="User's timezone")
     created_at: str = Field(..., description="Profile creation timestamp")
     updated_at: str = Field(..., description="Profile last update timestamp")
@@ -158,4 +162,26 @@ class UserProfileResponse(BaseModel):
 class AvailableTimezonesResponse(BaseModel):
     """Schema for available timezones response."""
     common_timezones: List[Dict[str, str]] = Field(..., description="List of common timezones with current time")
-    total_available: int = Field(..., description="Total number of available timezones") 
+    total_available: int = Field(..., description="Total number of available timezones")
+
+
+# User name management schemas
+
+class SetUserNameRequest(BaseModel):
+    """Schema for setting user name."""
+    user_id: str = Field(..., description="User identifier")
+    first_name: Optional[str] = Field(None, description="User's first name")
+    last_name: Optional[str] = Field(None, description="User's last name")
+    display_name: Optional[str] = Field(None, description="User's display name")
+    email: Optional[str] = Field(None, description="User's email address")
+
+
+class UserNameResponse(BaseModel):
+    """Schema for user name responses."""
+    success: bool = Field(..., description="Whether the operation was successful")
+    user_id: str = Field(..., description="User identifier")
+    first_name: Optional[str] = Field(None, description="User's first name")
+    last_name: Optional[str] = Field(None, description="User's last name")
+    display_name: Optional[str] = Field(None, description="User's display name")
+    email: Optional[str] = Field(None, description="User's email address")
+    message: Optional[str] = Field(None, description="Success or error message") 

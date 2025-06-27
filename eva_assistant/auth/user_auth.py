@@ -486,6 +486,84 @@ class UserAuthManager:
         except RuntimeError:
             return False
     
+    async def _auto_populate_user_info_from_calendar(self, user_id: str, primary_calendar: Dict, all_calendars: List[Dict]) -> None:
+        """
+        Automatically populate user information from calendar data during connection.
+        
+        Args:
+            user_id: User identifier
+            primary_calendar: Primary calendar information
+            all_calendars: List of all user calendars
+        """
+        try:
+            # Extract information from calendar data
+            extracted_info = {}
+            
+            # Get primary email from calendar ID (usually the user's email)
+            primary_email = primary_calendar.get('id', '')
+            if primary_email and '@' in primary_email:
+                extracted_info['email'] = primary_email
+                
+                # Try to extract name from email (basic heuristic)
+                email_parts = primary_email.split('@')[0]
+                if '.' in email_parts:
+                    name_parts = email_parts.split('.')
+                    if len(name_parts) >= 2:
+                        extracted_info['first_name'] = name_parts[0].title()
+                        extracted_info['last_name'] = name_parts[1].title()
+                        extracted_info['display_name'] = f"{extracted_info['first_name']} {extracted_info['last_name']}"
+                elif email_parts:
+                    # Single name in email
+                    extracted_info['first_name'] = email_parts.title()
+                    extracted_info['display_name'] = extracted_info['first_name']
+            
+            # Look for calendar summaries that might contain user names
+            for calendar in all_calendars:
+                summary = calendar.get('summary', '')
+                if summary and calendar.get('accessRole') == 'owner':
+                    # Check if summary looks like a person's name (contains spaces, proper case)
+                    if ' ' in summary and summary.replace(' ', '').replace("'", '').isalpha():
+                        # This might be a personal calendar with user's name
+                        name_parts = summary.strip().split()
+                        if len(name_parts) == 2:
+                            # Looks like "First Last" format
+                            extracted_info['first_name'] = name_parts[0]
+                            extracted_info['last_name'] = name_parts[1]
+                            extracted_info['display_name'] = summary.strip()
+                            break
+            
+            # Check if user already has name information
+            current_profile = self.get_user_profile(user_id)
+            has_existing_name = (
+                current_profile.get('first_name') or 
+                current_profile.get('last_name') or 
+                current_profile.get('display_name')
+            )
+            
+            # Only auto-populate if no name information exists and we extracted something useful
+            if not has_existing_name and extracted_info:
+                logger.info(f"Auto-populating user info for {user_id} from calendar data: {extracted_info}")
+                
+                # Set the extracted information
+                self.set_user_name(
+                    user_id=user_id,
+                    first_name=extracted_info.get('first_name'),
+                    last_name=extracted_info.get('last_name'),
+                    display_name=extracted_info.get('display_name'),
+                    email=extracted_info.get('email')
+                )
+                
+                logger.info(f"Successfully auto-populated name for user {user_id}: {self.get_user_display_name(user_id)}")
+            else:
+                if has_existing_name:
+                    logger.info(f"User {user_id} already has name information, skipping auto-population")
+                else:
+                    logger.info(f"Could not extract useful name information from calendar data for user {user_id}")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to auto-populate user info for {user_id}: {e}")
+            # Don't fail the calendar connection if name extraction fails
+    
     async def _refresh_user_credentials(self, user_id: str, creds: Credentials) -> Credentials:
         """
         Refresh expired credentials for a user.
@@ -715,9 +793,11 @@ class UserAuthManager:
             )
             calendars = calendar_list.get('items', [])
             
-            # Get basic user info
-            # Note: We only have calendar scope, so we can't get user profile
+            # Get basic user info from primary calendar
             primary_calendar = next((cal for cal in calendars if cal.get('primary')), {})
+            
+            # Try to extract user information and auto-populate profile
+            await self._auto_populate_user_info_from_calendar(user_id, primary_calendar, calendars)
             
             # IMPORTANT: Auto-detect non-interactive environment to avoid blocking I/O
             # Check if we're running in LangGraph/production environment
@@ -755,9 +835,17 @@ class UserAuthManager:
                 if cal.get('id') in selected_calendar_ids
             ]
             
+            # Get user profile information (including any auto-populated names)
+            user_profile = self.get_user_profile(user_id)
+            
             user_info = {
                 'user_id': user_id,
                 'email': primary_calendar.get('id', 'unknown'),
+                'name': {
+                    'first_name': user_profile.get('first_name'),
+                    'last_name': user_profile.get('last_name'),
+                    'display_name': user_profile.get('display_name') or self.get_user_display_name(user_id)
+                },
                 'total_calendars': len(calendars),
                 'selected_calendars': [
                     {
@@ -771,7 +859,9 @@ class UserAuthManager:
                 ],
                 'selected_calendar_count': len(selected_calendars),
                 'connected_at': str(Path(self._get_user_token_file(user_id)).stat().st_mtime),
-                'scopes': self.scopes
+                'scopes': self.scopes,
+                'timezone': self.get_user_timezone(user_id),
+                'auto_populated': bool(user_profile.get('first_name') or user_profile.get('last_name') or user_profile.get('display_name'))
             }
             
             logger.info(f"Successfully connected calendar for user {user_id} with {len(selected_calendars)} selected calendars")
@@ -1268,9 +1358,13 @@ class UserAuthManager:
         """
         profile_file = self._get_user_profile_file(user_id)
         
-        # Default profile with working hours
+        # Default profile with working hours and name fields
         default_profile = {
             'user_id': user_id,
+            'first_name': None,
+            'last_name': None,
+            'display_name': None,
+            'email': None,
             'timezone': 'UTC',
             'created_at': str(datetime.utcnow().isoformat()),
             'updated_at': str(datetime.utcnow().isoformat()),
@@ -1357,6 +1451,108 @@ class UserAuthManager:
             
         except Exception as e:
             logger.error(f"Failed to save working hours for user {user_id}: {e}")
+            return False
+    
+    def get_user_name(self, user_id: str) -> Dict[str, Optional[str]]:
+        """
+        Get the user's name information.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            Dictionary with name fields: first_name, last_name, display_name, email
+        """
+        profile = self.get_user_profile(user_id)
+        return {
+            'first_name': profile.get('first_name'),
+            'last_name': profile.get('last_name'),
+            'display_name': profile.get('display_name'),
+            'email': profile.get('email')
+        }
+    
+    def get_user_display_name(self, user_id: str) -> str:
+        """
+        Get the user's display name with fallback logic.
+        
+        Args:
+            user_id: Unique identifier for the user
+            
+        Returns:
+            User's display name with fallbacks:
+            1. display_name if set
+            2. "first_name last_name" if both are set
+            3. first_name if only first_name is set
+            4. email if available
+            5. user_id as last resort
+        """
+        profile = self.get_user_profile(user_id)
+        
+        # Try display_name first
+        if profile.get('display_name'):
+            return profile['display_name']
+        
+        # Try first_name + last_name
+        first_name = profile.get('first_name')
+        last_name = profile.get('last_name')
+        if first_name and last_name:
+            return f"{first_name} {last_name}"
+        
+        # Try just first_name
+        if first_name:
+            return first_name
+        
+        # Try email
+        if profile.get('email'):
+            return profile['email']
+        
+        # Fallback to user_id
+        return user_id
+    
+    def set_user_name(self, user_id: str, first_name: Optional[str] = None, 
+                     last_name: Optional[str] = None, display_name: Optional[str] = None,
+                     email: Optional[str] = None) -> bool:
+        """
+        Set the user's name information.
+        
+        Args:
+            user_id: Unique identifier for the user
+            first_name: User's first name (optional)
+            last_name: User's last name (optional)
+            display_name: User's display name (optional)
+            email: User's email address (optional)
+            
+        Returns:
+            True if name was saved successfully, False otherwise
+        """
+        try:
+            profile = self.get_user_profile(user_id)
+            
+            # Update name fields if provided
+            if first_name is not None:
+                profile['first_name'] = first_name.strip() if first_name else None
+            if last_name is not None:
+                profile['last_name'] = last_name.strip() if last_name else None
+            if display_name is not None:
+                profile['display_name'] = display_name.strip() if display_name else None
+            if email is not None:
+                profile['email'] = email.strip().lower() if email else None
+            
+            profile['updated_at'] = str(datetime.utcnow().isoformat())
+            
+            profile_file = self._get_user_profile_file(user_id)
+            
+            # Ensure directory exists
+            profile_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(profile_file, 'w') as f:
+                json.dump(profile, f, indent=2)
+            
+            logger.info(f"Updated name information for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save name for user {user_id}: {e}")
             return False
     
     def get_user_availability_for_date(self, user_id: str, date_str: str) -> Dict[str, Any]:

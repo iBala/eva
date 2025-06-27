@@ -8,9 +8,37 @@ from typing import Dict, Any
 from datetime import datetime
 
 
+def get_user_context(user_id: str) -> Dict[str, str]:
+    """
+    Get user context for personalizing prompts.
+    
+    Args:
+        user_id: User identifier
+        
+    Returns:
+        Dictionary with user context (boss_name, etc.)
+    """
+    try:
+        from eva_assistant.auth.user_auth import UserAuthManager
+        
+        user_auth = UserAuthManager()
+        display_name = user_auth.get_user_display_name(user_id)
+        
+        return {
+            'boss_name': display_name,
+            'user_id': user_id
+        }
+    except Exception:
+        # Fallback to default if user context cannot be retrieved
+        return {
+            'boss_name': 'the Founder',  # Generic fallback instead of hardcoded name
+            'user_id': user_id
+        }
+
+
 # Eva's core personality and behavior
 EVA_PERSONALITY = """# Role and Objective
-Your name is Eva. You are a highly reliable, detail-oriented Executive Assistant (EA) for a startup Founder named Johny Cashman. Your job is to maximize their productivity by helping them with their tasks. Your boss or his contacts will reach out to you via email or slack regarding meetings. You will plan the steps to set up the meeting in a reliable way. You function with high autonomy but must confirm intent clearly when ambiguous. Never assume. Always double-check critical details.
+Your name is Eva. You are a highly reliable, detail-oriented Executive Assistant (EA) for a startup Founder named {boss_name}. Your job is to maximize their productivity by helping them with their tasks. Your boss or his contacts will reach out to you via email or slack regarding meetings. You will plan the steps to set up the meeting in a reliable way. You function with high autonomy but must confirm intent clearly when ambiguous. Never assume. Always double-check critical details.
 
 # Instructions
 - You have access to an agent that can perform the actions you need to perform. You will use the agent to perform the actions. The action agent has access to the tools to perform the actions.
@@ -154,7 +182,7 @@ Tool calls will be executed automatically. Focus on providing the right paramete
 
 # Eva's meeting agent prompt - handles main logic with tools
 MEETING_AGENT_PROMPT = """# Role and Objective
-Your name is Eva. You are a highly reliable, detail-oriented Executive Assistant (EA) for a startup Founder named Johny Cashman. Your job is to maximize their productivity by helping them with their tasks. Your boss or his contacts will reach out to you via email or slack regarding meetings. You will use the available tools and memory to set up the meeting in a reliable way. You function with high autonomy but must confirm intent clearly when ambiguous. Never assume. Always double-check critical details.
+Your name is Eva. You are a highly reliable, detail-oriented Executive Assistant (EA) for a startup Founder named {boss_name}. Your job is to maximize their productivity by helping them with their tasks. Your boss or his contacts will reach out to you via email or slack regarding meetings. You will use the available tools and memory to set up the meeting in a reliable way. You function with high autonomy but must confirm intent clearly when ambiguous. Never assume. Always double-check critical details.
 
 # Instructions
 - Use calendar to get access to the calendars of your boss and/or his contacts. 
@@ -333,6 +361,10 @@ def get_tool_execution_prompt(state: Dict[str, Any], available_tools: list) -> s
 def get_meeting_agent_prompt(state: Dict[str, Any]) -> str:
     """Get the meeting agent prompt with current context."""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_id = state.get("user_id", "founder")
+    
+    # Get user context for personalization
+    user_context = get_user_context(user_id)
     
     # Get tool results
     tool_results = []
@@ -349,9 +381,11 @@ def get_meeting_agent_prompt(state: Dict[str, Any]) -> str:
     
     context_text = "\n".join([f"{k}: {v}" for k, v in context.items()]) if context else "None"
     
+    # Format the prompt with all variables
     return MEETING_AGENT_PROMPT.format(
+        boss_name=user_context.get('boss_name', 'the Founder'),
         current_time=current_time,
-        user_id=state.get("user_id", "founder"),
+        user_id=user_id,
         current_request=state.get("current_request", ""),
         context=context_text,
         tool_results=tool_results_text

@@ -28,7 +28,8 @@ from eva_assistant.app.schemas import (
     UpdateCalendarSelectionRequest, UpdateCalendarSelectionResponse,
     GetCalendarInfoRequest, GetCalendarInfoResponse,
     SetTimezoneRequest, TimezoneResponse, UserProfileResponse,
-    AvailableTimezonesResponse
+    AvailableTimezonesResponse,
+    SetUserNameRequest, UserNameResponse
 )
 from eva_assistant.auth.user_auth import UserAuthManager
 from eva_assistant.auth.eva_auth import EvaAuthManager
@@ -774,6 +775,10 @@ async def get_user_profile(user_id: str) -> UserProfileResponse:
         
         return UserProfileResponse(
             user_id=profile['user_id'],
+            first_name=profile.get('first_name'),
+            last_name=profile.get('last_name'),
+            display_name=profile.get('display_name'),
+            email=profile.get('email'),
             timezone=profile['timezone'],
             created_at=profile['created_at'],
             updated_at=profile['updated_at'],
@@ -839,6 +844,113 @@ async def get_available_timezones() -> AvailableTimezonesResponse:
         
     except Exception as e:
         logger.error(f"Get timezones error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# User Name Management Endpoints
+
+@app.post("/user/name", response_model=UserNameResponse)
+async def set_user_name(request: SetUserNameRequest) -> UserNameResponse:
+    """
+    Set user's name information.
+    
+    Args:
+        request: SetUserNameRequest with user_id and name fields
+        
+    Returns:
+        UserNameResponse with updated name information
+    """
+    try:
+        user_auth = UserAuthManager()
+        
+        # Set the user's name
+        success = user_auth.set_user_name(
+            user_id=request.user_id,
+            first_name=request.first_name,
+            last_name=request.last_name,
+            display_name=request.display_name,
+            email=request.email
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to save user name")
+        
+        # Get updated name information
+        name_info = user_auth.get_user_name(request.user_id)
+        
+        return UserNameResponse(
+            success=True,
+            user_id=request.user_id,
+            first_name=name_info['first_name'],
+            last_name=name_info['last_name'],
+            display_name=name_info['display_name'],
+            email=name_info['email'],
+            message="User name updated successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Set user name error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/{user_id}/name", response_model=UserNameResponse)
+async def get_user_name(user_id: str) -> UserNameResponse:
+    """
+    Get user's name information.
+    
+    Args:
+        user_id: User identifier
+        
+    Returns:
+        UserNameResponse with user's name information
+    """
+    try:
+        user_auth = UserAuthManager()
+        name_info = user_auth.get_user_name(user_id)
+        
+        return UserNameResponse(
+            success=True,
+            user_id=user_id,
+            first_name=name_info['first_name'],
+            last_name=name_info['last_name'],
+            display_name=name_info['display_name'],
+            email=name_info['email'],
+            message="User name retrieved successfully"
+        )
+        
+    except Exception as e:
+        logger.error(f"Get user name error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/{user_id}/display-name")
+async def get_user_display_name(user_id: str):
+    """
+    Get user's display name with fallback logic.
+    
+    Args:
+        user_id: User identifier
+        
+    Returns:
+        Dictionary with display name and fallback information
+    """
+    try:
+        user_auth = UserAuthManager()
+        display_name = user_auth.get_user_display_name(user_id)
+        name_info = user_auth.get_user_name(user_id)
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "display_name": display_name,
+            "name_info": name_info,
+            "message": "Display name retrieved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Get user display name error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

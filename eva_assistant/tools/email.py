@@ -58,20 +58,37 @@ class SendEmailTool(ToolABC):
     returns = lambda result: f"Email sent to {', '.join(result.get('recipients', []))}"
     
     async def run(self, args: SendEmailArgs) -> Dict[str, Any]:
-        """Send an email using Eva's Gmail account."""
+        """Send an email using Eva's Gmail account (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: SendEmailArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Send an email using Eva's Gmail account with user context."""
         try:
+            # Get boss name from context for signature
+            boss_name = context.get('boss_name')
+            if not boss_name:
+                # Try to get from primary user context
+                primary_user_id = context.get('primary_user_id', 'founder')
+                try:
+                    from eva_assistant.agent.prompts import get_user_context
+                    user_context = get_user_context(primary_user_id)
+                    boss_name = user_context.get('boss_name')
+                except Exception:
+                    boss_name = None
+            
             # Use Eva's dedicated auth manager for sending emails
             eva_auth = EvaAuthManager()
             service = await eva_auth.get_gmail_service()
             
-            # Create the email message
+            # Create the email message with boss name for signature
             message = self._create_email_message(
                 to=args.to,
                 subject=args.subject,
                 body=args.body,
                 cc=args.cc,
                 bcc=args.bcc,
-                reply_to=args.reply_to
+                reply_to=args.reply_to,
+                boss_name=boss_name
             )
             
             # Send the email
@@ -80,7 +97,7 @@ class SendEmailTool(ToolABC):
                 body=message
             ).execute()
             
-            logger.info(f"Email sent successfully to {args.to}, message ID: {result.get('id')}")
+            logger.info(f"Email sent successfully to {args.to}, message ID: {result.get('id')} (boss: {boss_name})")
             
             return {
                 'success': True,
@@ -88,6 +105,7 @@ class SendEmailTool(ToolABC):
                 'recipients': args.to,
                 'subject': args.subject,
                 'thread_id': result.get('threadId'),
+                'boss_name': boss_name,
                 'message': 'Email sent successfully'
             }
             
@@ -102,7 +120,7 @@ class SendEmailTool(ToolABC):
     
     def _create_email_message(self, to: List[str], subject: str, body: str, 
                              cc: List[str] = None, bcc: List[str] = None, 
-                             reply_to: str = None) -> Dict[str, str]:
+                             reply_to: str = None, boss_name: str = None) -> Dict[str, str]:
         """Create an email message in the format expected by Gmail API."""
         
         # Create MIME message
@@ -117,8 +135,8 @@ class SendEmailTool(ToolABC):
         if reply_to:
             msg['Reply-To'] = reply_to
         
-        # Add signature to body
-        body_with_signature = self._add_signature(body)
+        # Add signature to body with boss name
+        body_with_signature = self._add_signature(body, boss_name)
         
         # Attach plain text version
         text_part = MIMEText(body_with_signature, 'plain')
@@ -129,9 +147,12 @@ class SendEmailTool(ToolABC):
         
         return {'raw': raw_message}
     
-    def _add_signature(self, body: str) -> str:
+    def _add_signature(self, body: str, boss_name: str = None) -> str:
         """Add Eva's professional signature to the email."""
-        signature = "\n\nBest regards,\nEva\nExecutive Assistant to Johny Cashman"
+        if boss_name:
+            signature = f"\n\nBest regards,\nEva\nExecutive Assistant to {boss_name}"
+        else:
+            signature = "\n\nBest regards,\nEva\nExecutive Assistant"
         
         # Add signature if not already present
         if "Best regards,\nEva" not in body and "Best,\nEva" not in body:
@@ -149,20 +170,37 @@ class DraftEmailTool(ToolABC):
     returns = lambda result: f"Draft created for: {result.get('subject', 'No subject')}"
     
     async def run(self, args: DraftEmailArgs) -> Dict[str, Any]:
-        """Create an email draft in Eva's Gmail account."""
+        """Create an email draft in Eva's Gmail account (backward compatibility)."""
+        return await self.run_with_context(args, {})
+    
+    async def run_with_context(self, args: DraftEmailArgs, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Create an email draft in Eva's Gmail account with user context."""
         try:
+            # Get boss name from context for signature
+            boss_name = context.get('boss_name')
+            if not boss_name:
+                # Try to get from primary user context
+                primary_user_id = context.get('primary_user_id', 'founder')
+                try:
+                    from eva_assistant.agent.prompts import get_user_context
+                    user_context = get_user_context(primary_user_id)
+                    boss_name = user_context.get('boss_name')
+                except Exception:
+                    boss_name = None
+            
             # Use Eva's dedicated auth manager for creating drafts
             eva_auth = EvaAuthManager()
             service = await eva_auth.get_gmail_service()
             
-            # Create the email message
+            # Create the email message with boss name for signature
             send_tool = SendEmailTool()
             message = send_tool._create_email_message(
                 to=args.to,
                 subject=args.subject,
                 body=args.body,
                 cc=args.cc,
-                bcc=args.bcc
+                bcc=args.bcc,
+                boss_name=boss_name
             )
             
             # Create draft
@@ -172,7 +210,7 @@ class DraftEmailTool(ToolABC):
                 body=draft_body
             ).execute()
             
-            logger.info(f"Email draft created for {args.to}, draft ID: {draft.get('id')}")
+            logger.info(f"Email draft created for {args.to}, draft ID: {draft.get('id')} (boss: {boss_name})")
             
             return {
                 'success': True,
@@ -180,6 +218,7 @@ class DraftEmailTool(ToolABC):
                 'message_id': draft.get('message', {}).get('id'),
                 'recipients': args.to,
                 'subject': args.subject,
+                'boss_name': boss_name,
                 'message': 'Draft created successfully'
             }
             
